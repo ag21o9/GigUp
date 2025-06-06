@@ -1,0 +1,102 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  password     String
+  role         Role
+  profileImage String?
+  bio          String?
+  location     String?
+  createdAt    DateTime @default(now())
+
+  // Relations
+  freelancer Freelancer?
+  client     Client?
+
+  @@map("users")
+}
+
+model Freelancer {
+  id                String   @id @default(cuid())
+  userId            String   @unique
+  age               Int?
+  skills            String[]
+  experience        String?
+  projectsCompleted Int      @default(0)
+  ratings           Float    @default(0)
+  hourlyRate        Float?
+  availability      Boolean  @default(true)
+  githubUrl         String?
+  linkedinUrl       String?
+  portfolioUrl      String?
+
+  // Relations
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  assignedProjects Project[]
+
+  @@map("freelancers")
+}
+
+model Client {
+  id             String  @id @default(cuid())
+  userId         String  @unique
+  companyName    String?
+  industry       String?
+  projectsPosted Int     @default(0)
+  ratings        Float   @default(0)
+  website        String?
+
+  // Relations
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projects Project[]
+
+  @@map("clients")
+}
+
+model Project {
+  id             String        @id @default(cuid())
+  title          String
+  description    String?
+  clientId       String
+  skillsRequired String[]
+  budgetMin      Float?
+  budgetMax      Float?
+  duration       String?
+  status         ProjectStatus @default(OPEN)
+  assignedTo     String?
+  createdAt      DateTime      @default(now())
+
+  // Relations
+  client     Client      @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  freelancer Freelancer? @relation(fields: [assignedTo], references: [id])
+
+  @@map("projects")
+}
+
+enum Role {
+  CLIENT
+  FREELANCER
+}
+
+enum ProjectStatus {
+  OPEN
+  ASSIGNED
+  COMPLETED
+  CANCELLED
+}
