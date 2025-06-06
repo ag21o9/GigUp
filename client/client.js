@@ -13,7 +13,6 @@ import { authenticateToken } from "../middleware/auth.js";
 
 export const clientRouter = Router();
 
-
 // Configure multer for file uploads (profile images)
 const storage = multer.memoryStorage();
 const upload = multer({
@@ -166,6 +165,13 @@ clientRouter.get('/projects', authenticateToken, async (req, res) => {
                             }
                         }
                     }
+                },
+                applications: {
+                    select: {
+                        id: true,
+                        status: true,
+                        createdAt: true
+                    }
                 }
             },
             orderBy: {
@@ -202,11 +208,14 @@ clientRouter.get('/projects', authenticateToken, async (req, res) => {
     }
 });
 
-// PUT /api/client/projects/:projectId/assign/:freelancerId - Assign project to freelancer
-clientRouter.put('/projects/:projectId/assign/:freelancerId', authenticateToken, async (req, res) => {
+// GET /api/client/projects/:projectId/applications - Get all applications for a specific project
+clientRouter.get('/projects/:projectId/applications', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.userId;
-        const { projectId, freelancerId } = req.params;
+        const { projectId } = req.params;
+        const { status, page = 1, limit = 10 } = req.query;
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
 
         // Check if user is a client
         const client = await prisma.client.findUnique({
@@ -220,7 +229,108 @@ clientRouter.put('/projects/:projectId/assign/:freelancerId', authenticateToken,
             });
         }
 
-        // Check if project exists and belongs to this client
+        // Check if project belongs to this client
+        const project = await prisma.project.findFirst({
+            where: {
+                id: projectId,
+                clientId: client.id
+            }
+        });
+
+        if (!project) {
+            return res.status(404).json({
+                success: false,
+                message: 'Project not found or you do not have permission to view it'
+            });
+        }
+
+        const whereClause = {
+            projectId
+        };
+
+        if (status) {
+            whereClause.status = status.toUpperCase();
+        }
+
+        const applications = await prisma.application.findMany({
+            where: whereClause,
+            include: {
+                freelancer: {
+                    include: {
+                        user: {
+                            select: {
+                                name: true,
+                                email: true,
+                                profileImage: true,
+                                bio: true,
+                                location: true
+                            }
+                        }
+                    }
+                },
+                project: {
+                    select: {
+                        title: true,
+                        description: true,
+                        skillsRequired: true,
+                        budgetMin: true,
+                        budgetMax: true
+                    }
+                }
+            },
+            orderBy: {
+                createdAt: 'desc'
+            },
+            skip,
+            take: parseInt(limit)
+        });
+
+        const totalApplications = await prisma.application.count({
+            where: whereClause
+        });
+
+        res.status(200).json({
+            success: true,
+            data: {
+                applications,
+                pagination: {
+                    page: parseInt(page),
+                    limit: parseInt(limit),
+                    total: totalApplications,
+                    pages: Math.ceil(totalApplications / parseInt(limit))
+                }
+            }
+        });
+
+    } catch (error) {
+        console.error('Get project applications error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// PUT /api/client/projects/:projectId/applications/:applicationId/approve - Approve an application
+clientRouter.put('/projects/:projectId/applications/:applicationId/approve', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { projectId, applicationId } = req.params;
+
+        // Check if user is a client
+        const client = await prisma.client.findUnique({
+            where: { userId }
+        });
+
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                message: 'Client not found'
+            });
+        }
+
+        // Check if project belongs to this client
         const project = await prisma.project.findFirst({
             where: {
                 id: projectId,
@@ -242,33 +352,11 @@ clientRouter.put('/projects/:projectId/assign/:freelancerId', authenticateToken,
             });
         }
 
-        // Check if freelancer exists
-        const freelancer = await prisma.freelancer.findUnique({
-            where: { id: freelancerId },
-            include: {
-                user: {
-                    select: {
-                        name: true,
-                        email: true,
-                        profileImage: true
-                    }
-                }
-            }
-        });
-
-        if (!freelancer) {
-            return res.status(404).json({
-                success: false,
-                message: 'Freelancer not found'
-            });
-        }
-
-        // Assign project to freelancer
-        const updatedProject = await prisma.project.update({
-            where: { id: projectId },
-            data: {
-                assignedTo: freelancerId,
-                status: 'ASSIGNED'
+        // Check if application exists and belongs to this project
+        const application = await prisma.application.findFirst({
+            where: {
+                id: applicationId,
+                projectId
             },
             include: {
                 freelancer: {
@@ -281,12 +369,149 @@ clientRouter.put('/projects/:projectId/assign/:freelancerId', authenticateToken,
                             }
                         }
                     }
+                }
+            }
+        });
+
+        if (!application) {
+            return res.status(404).json({
+                success: false,
+                message: 'Application not found'
+            });
+        }
+
+        if (application.status !== 'PENDING') {
+            return res.status(400).json({
+                success: false,
+                message: 'Application has already been processed'
+            });
+        }
+
+        // Use transaction to approve application and assign project
+        const result = await prisma.$transaction(async (tx) => {
+            // Approve the application
+            const approvedApplication = await tx.application.update({
+                where: { id: applicationId },
+                data: { status: 'APPROVED' },
+                include: {
+                    freelancer: {
+                        include: {
+                            user: {
+                                select: {
+                                    name: true,
+                                    email: true,
+                                    profileImage: true
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            // Assign project to freelancer
+            const updatedProject = await tx.project.update({
+                where: { id: projectId },
+                data: {
+                    assignedTo: application.freelancerId,
+                    status: 'ASSIGNED'
+                }
+            });
+
+            // Reject all other pending applications for this project
+            await tx.application.updateMany({
+                where: {
+                    projectId,
+                    id: { not: applicationId },
+                    status: 'PENDING'
                 },
-                client: {
+                data: { status: 'REJECTED' }
+            });
+
+            return { approvedApplication, updatedProject };
+        });
+
+        res.status(200).json({
+            success: true,
+            message: 'Application approved and project assigned successfully',
+            data: result.approvedApplication
+        });
+
+    } catch (error) {
+        console.error('Approve application error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// PUT /api/client/projects/:projectId/applications/:applicationId/reject - Reject an application
+clientRouter.put('/projects/:projectId/applications/:applicationId/reject', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { projectId, applicationId } = req.params;
+
+        // Check if user is a client
+        const client = await prisma.client.findUnique({
+            where: { userId }
+        });
+
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                message: 'Client not found'
+            });
+        }
+
+        // Check if project belongs to this client
+        const project = await prisma.project.findFirst({
+            where: {
+                id: projectId,
+                clientId: client.id
+            }
+        });
+
+        if (!project) {
+            return res.status(404).json({
+                success: false,
+                message: 'Project not found or you do not have permission to modify it'
+            });
+        }
+
+        // Check if application exists and belongs to this project
+        const application = await prisma.application.findFirst({
+            where: {
+                id: applicationId,
+                projectId
+            }
+        });
+
+        if (!application) {
+            return res.status(404).json({
+                success: false,
+                message: 'Application not found'
+            });
+        }
+
+        if (application.status !== 'PENDING') {
+            return res.status(400).json({
+                success: false,
+                message: 'Application has already been processed'
+            });
+        }
+
+        // Reject the application
+        const rejectedApplication = await prisma.application.update({
+            where: { id: applicationId },
+            data: { status: 'REJECTED' },
+            include: {
+                freelancer: {
                     include: {
                         user: {
                             select: {
                                 name: true,
+                                email: true,
                                 profileImage: true
                             }
                         }
@@ -297,12 +522,118 @@ clientRouter.put('/projects/:projectId/assign/:freelancerId', authenticateToken,
 
         res.status(200).json({
             success: true,
-            message: 'Project assigned successfully',
-            data: updatedProject
+            message: 'Application rejected successfully',
+            data: rejectedApplication
         });
 
     } catch (error) {
-        console.error('Assign project error:', error);
+        console.error('Reject application error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// GET /api/client/applications - Get all applications for all projects
+clientRouter.get('/applications', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { status, page = 1, limit = 10 } = req.query;
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        // Check if user is a client
+        const client = await prisma.client.findUnique({
+            where: { userId }
+        });
+
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                message: 'Client not found'
+            });
+        }
+
+        const whereClause = {
+            project: {
+                clientId: client.id
+            }
+        };
+
+        if (status) {
+            whereClause.status = status.toUpperCase();
+        }
+
+        const applications = await prisma.application.findMany({
+            where: whereClause,
+            include: {
+                freelancer: {
+                    include: {
+                        user: {
+                            select: {
+                                name: true,
+                                email: true,
+                                profileImage: true,
+                                bio: true,
+                                location: true
+                            }
+                        }
+                    }
+                },
+                project: {
+                    select: {
+                        id: true,
+                        title: true,
+                        description: true,
+                        skillsRequired: true,
+                        budgetMin: true,
+                        budgetMax: true,
+                        status: true
+                    }
+                }
+            },
+            orderBy: {
+                createdAt: 'desc'
+            },
+            skip,
+            take: parseInt(limit)
+        });
+
+        const totalApplications = await prisma.application.count({
+            where: whereClause
+        });
+
+        // Group applications by project
+        const groupedApplications = applications.reduce((acc, app) => {
+            const projectId = app.project.id;
+            if (!acc[projectId]) {
+                acc[projectId] = {
+                    project: app.project,
+                    applications: []
+                };
+            }
+            acc[projectId].applications.push(app);
+            return acc;
+        }, {});
+
+        res.status(200).json({
+            success: true,
+            data: {
+                applications,
+                groupedApplications: Object.values(groupedApplications),
+                pagination: {
+                    page: parseInt(page),
+                    limit: parseInt(limit),
+                    total: totalApplications,
+                    pages: Math.ceil(totalApplications / parseInt(limit))
+                }
+            }
+        });
+
+    } catch (error) {
+        console.error('Get all applications error:', error);
         res.status(500).json({
             success: false,
             message: 'Internal server error',
@@ -337,6 +668,16 @@ clientRouter.get('/dashboard', authenticateToken, async (req, res) => {
                                     }
                                 }
                             }
+                        },
+                        applications: {
+                            where: {
+                                status: 'PENDING'
+                            },
+                            select: {
+                                id: true,
+                                status: true,
+                                createdAt: true
+                            }
                         }
                     },
                     orderBy: {
@@ -358,7 +699,8 @@ clientRouter.get('/dashboard', authenticateToken, async (req, res) => {
             openProjects: client.projects.filter(p => p.status === 'OPEN').length,
             assignedProjects: client.projects.filter(p => p.status === 'ASSIGNED').length,
             completedProjects: client.projects.filter(p => p.status === 'COMPLETED').length,
-            rating: client.ratings
+            rating: client.ratings,
+            pendingApplications: client.projects.reduce((sum, project) => sum + project.applications.length, 0)
         };
 
         res.status(200).json({

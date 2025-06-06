@@ -47,8 +47,9 @@ model Freelancer {
   portfolioUrl      String?
 
   // Relations
-  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user             User          @relation(fields: [userId], references: [id], onDelete: Cascade)
   assignedProjects Project[]
+  applications     Application[]
 
   @@map("freelancers")
 }
@@ -83,10 +84,30 @@ model Project {
   createdAt      DateTime      @default(now())
 
   // Relations
-  client     Client      @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  freelancer Freelancer? @relation(fields: [assignedTo], references: [id])
+  client       Client        @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  freelancer   Freelancer?   @relation(fields: [assignedTo], references: [id])
+  applications Application[]
 
   @@map("projects")
+}
+
+model Application {
+  id           String            @id @default(cuid())
+  projectId    String
+  freelancerId String
+  proposal     String?
+  coverLetter  String?
+  status       ApplicationStatus @default(PENDING)
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  // Relations
+  project    Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  freelancer Freelancer @relation(fields: [freelancerId], references: [id], onDelete: Cascade)
+
+  // Prevent duplicate applications
+  @@unique([projectId, freelancerId])
+  @@map("applications")
 }
 
 enum Role {
@@ -99,4 +120,10 @@ enum ProjectStatus {
   ASSIGNED
   COMPLETED
   CANCELLED
+}
+
+enum ApplicationStatus {
+  PENDING
+  APPROVED
+  REJECTED
 }

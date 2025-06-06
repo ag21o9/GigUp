@@ -1,20 +1,20 @@
 import express from 'express';
-
-import dotenv from 'dotenv';
-dotenv.config();
-const app = express();
-
 import cors from 'cors';
-app.use(cors());
+import dotenv from 'dotenv';
+
 
 import {PrismaClient} from './generated/prisma/client.js'; // 
 const prisma = new PrismaClient();
+
 import { flRouter } from './freelancer/freelancer.js';
 import { clientRouter } from './client/client.js';
 
 const PORT = process.env.PORT || 3000;
+const app = express();
 
 
+dotenv.config();
+app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 

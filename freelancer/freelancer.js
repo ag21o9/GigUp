@@ -71,6 +71,28 @@ flRouter.get('/dashboard', authenticateToken, async (req, res) => {
                     orderBy: {
                         createdAt: 'desc'
                     }
+                },
+                applications: {
+                    include: {
+                        project: {
+                            include: {
+                                client: {
+                                    include: {
+                                        user: {
+                                            select: {
+                                                name: true,
+                                                profileImage: true
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    orderBy: {
+                        createdAt: 'desc'
+                    },
+                    take: 5 // Latest 5 applications
                 }
             }
         });
@@ -87,7 +109,9 @@ flRouter.get('/dashboard', authenticateToken, async (req, res) => {
             activeProjects: freelancer.assignedProjects.filter(p => p.status === 'ASSIGNED').length,
             completedProjects: freelancer.assignedProjects.filter(p => p.status === 'COMPLETED').length,
             rating: freelancer.ratings,
-            availability: freelancer.availability
+            availability: freelancer.availability,
+            pendingApplications: freelancer.applications.filter(app => app.status === 'PENDING').length,
+            approvedApplications: freelancer.applications.filter(app => app.status === 'APPROVED').length
         };
 
         res.status(200).json({
@@ -186,7 +210,7 @@ flRouter.get('/projects/available', authenticateToken, async (req, res) => {
         // Get freelancer's skills for filtering
         const freelancer = await prisma.freelancer.findUnique({
             where: { userId },
-            select: { skills: true }
+            select: { skills: true, id: true }
         });
 
         if (!freelancer) {
@@ -230,6 +254,16 @@ flRouter.get('/projects/available', authenticateToken, async (req, res) => {
                             }
                         }
                     }
+                },
+                applications: {
+                    where: {
+                        freelancerId: freelancer.id
+                    },
+                    select: {
+                        id: true,
+                        status: true,
+                        createdAt: true
+                    }
                 }
             },
             orderBy: {
@@ -266,12 +300,12 @@ flRouter.get('/projects/available', authenticateToken, async (req, res) => {
     }
 });
 
-// PUT /api/freelancer/projects/:projectId/apply - Apply for a project
-flRouter.put('/projects/:projectId/apply', authenticateToken, async (req, res) => {
+// POST /api/freelancer/projects/:projectId/apply - Apply for a project
+flRouter.post('/projects/:projectId/apply', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.userId;
         const { projectId } = req.params;
-        const { proposal } = req.body;
+        const { proposal, coverLetter } = req.body;
 
         // Check if freelancer exists and is available
         const freelancer = await prisma.freelancer.findUnique({
@@ -294,7 +328,19 @@ flRouter.put('/projects/:projectId/apply', authenticateToken, async (req, res) =
 
         // Check if project exists and is open
         const project = await prisma.project.findUnique({
-            where: { id: projectId }
+            where: { id: projectId },
+            include: {
+                client: {
+                    include: {
+                        user: {
+                            select: {
+                                name: true,
+                                profileImage: true
+                            }
+                        }
+                    }
+                }
+            }
         });
 
         if (!project) {
@@ -318,19 +364,148 @@ flRouter.put('/projects/:projectId/apply', authenticateToken, async (req, res) =
             });
         }
 
-        // For now, we'll just send a success message
-        // In a real app, you might want to create a separate "Application" model
-        res.status(200).json({
-            success: true,
-            message: 'Application submitted successfully',
+        // Check if freelancer has already applied
+        const existingApplication = await prisma.application.findUnique({
+            where: {
+                projectId_freelancerId: {
+                    projectId,
+                    freelancerId: freelancer.id
+                }
+            }
+        });
+
+        if (existingApplication) {
+            return res.status(400).json({
+                success: false,
+                message: 'You have already applied for this project'
+            });
+        }
+
+        // Create application
+        const application = await prisma.application.create({
             data: {
                 projectId,
-                proposal: proposal || 'Application submitted'
+                freelancerId: freelancer.id,
+                proposal,
+                coverLetter
+            },
+            include: {
+                project: {
+                    include: {
+                        client: {
+                            include: {
+                                user: {
+                                    select: {
+                                        name: true,
+                                        profileImage: true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                freelancer: {
+                    include: {
+                        user: {
+                            select: {
+                                name: true,
+                                profileImage: true
+                            }
+                        }
+                    }
+                }
             }
+        });
+
+        res.status(201).json({
+            success: true,
+            message: 'Application submitted successfully',
+            data: application
         });
 
     } catch (error) {
         console.error('Apply for project error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// GET /api/freelancer/applications - Get all applications
+flRouter.get('/applications', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { status, page = 1, limit = 10 } = req.query;
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        const freelancer = await prisma.freelancer.findUnique({
+            where: { userId },
+            select: { id: true }
+        });
+
+        if (!freelancer) {
+            return res.status(404).json({
+                success: false,
+                message: 'Freelancer not found'
+            });
+        }
+
+        const whereClause = {
+            freelancerId: freelancer.id
+        };
+
+        if (status) {
+            whereClause.status = status.toUpperCase();
+        }
+
+        const applications = await prisma.application.findMany({
+            where: whereClause,
+            include: {
+                project: {
+                    include: {
+                        client: {
+                            include: {
+                                user: {
+                                    select: {
+                                        name: true,
+                                        email: true,
+                                        profileImage: true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            orderBy: {
+                createdAt: 'desc'
+            },
+            skip,
+            take: parseInt(limit)
+        });
+
+        const totalApplications = await prisma.application.count({
+            where: whereClause
+        });
+
+        res.status(200).json({
+            success: true,
+            data: {
+                applications,
+                pagination: {
+                    page: parseInt(page),
+                    limit: parseInt(limit),
+                    total: totalApplications,
+                    pages: Math.ceil(totalApplications / parseInt(limit))
+                }
+            }
+        });
+
+    } catch (error) {
+        console.error('Get applications error:', error);
         res.status(500).json({
             success: false,
             message: 'Internal server error',
