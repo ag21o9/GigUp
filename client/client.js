@@ -1,6 +1,7 @@
 import { Router } from "express";
 import multer from "multer";
-import { PrismaClient } from '../generated/prisma/index.js';
+
+import prisma from "../prisma.config.js";
 import {
     signup,
     login,
@@ -10,8 +11,8 @@ import {
 } from "./auth.js";
 import { authenticateToken } from "../middleware/auth.js";
 
-const prisma = new PrismaClient();
 export const clientRouter = Router();
+
 
 // Configure multer for file uploads (profile images)
 const storage = multer.memoryStorage();
