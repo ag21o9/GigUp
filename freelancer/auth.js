@@ -2,6 +2,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import prisma from '../prisma.config.js';
 import { uploadImage, deleteImage } from '../utils/cloudinary.js';
+import { setCache, getCache } from '../utils/redis.js';
 
 // Helper function to generate JWT token
 const generateToken = (userId, role) => {
@@ -144,16 +145,19 @@ export const signup = async (req, res) => {
 export const login = async (req, res) => {
     try {
         const { email, password } = req.body;
+        const cacheKey = `freelancer:login:${email}`;
 
-        // Validation
-        if (!email || !password) {
-            return res.status(400).json({
-                success: false,
-                message: 'Email and password are required'
+        // Check cache
+        const cachedUser = await getCache(cacheKey);
+        if (cachedUser) {
+            return res.status(200).json({
+                success: true,
+                message: 'Login successful',
+                data: cachedUser
             });
         }
 
-        // Find user with freelancer profile
+        // Fetch user from database
         const user = await prisma.user.findUnique({
             where: { email },
             include: {
@@ -180,18 +184,19 @@ export const login = async (req, res) => {
         // Generate JWT token
         const token = generateToken(user.id, user.role);
 
-        // Remove password from response
-        const { password: _, ...userWithoutPassword } = user;
+        const responseData = {
+            user: { ...user, password: undefined },
+            token
+        };
+
+        // Cache the login data
+        await setCache(cacheKey, responseData, 600); // Cache for 10 minutes
 
         res.status(200).json({
             success: true,
             message: 'Login successful',
-            data: {
-                user: userWithoutPassword,
-                token
-            }
+            data: responseData
         });
-
     } catch (error) {
         console.error('Login error:', error);
         res.status(500).json({

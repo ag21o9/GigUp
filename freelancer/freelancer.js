@@ -9,6 +9,7 @@ import {
 } from "./auth.js";
 
 import { authenticateToken } from "../middleware/auth.js";
+import { setCache, getCache, deleteCache } from "../utils/redis.js";
 
 import prisma from "../prisma.config.js";
 
@@ -35,65 +36,95 @@ flRouter.post('/signup', upload.single('profileImage'), signup);
 flRouter.post('/login', login);
 
 // Profile Management Routes (Protected)
-flRouter.get('/profile', authenticateToken, getProfile);
-flRouter.put('/profile', authenticateToken, upload.single('profileImage'), updateProfile);
-flRouter.put('/availability', authenticateToken, updateAvailability);
+flRouter.get('/profile', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const cacheKey = `freelancer:profile:${userId}`;
 
-// Additional freelancer-specific routes
+        // Check cache
+        const cachedProfile = await getCache(cacheKey);
+        if (cachedProfile) {
+            return res.status(200).json({
+                success: true,
+                data: cachedProfile
+            });
+        }
+
+        // Fetch profile from database
+        const user = await prisma.user.findUnique({
+            where: { id: userId },
+            include: {
+                freelancer: true
+            }
+        });
+
+        if (!user || user.role !== 'FREELANCER') {
+            return res.status(404).json({
+                success: false,
+                message: 'Freelancer not found'
+            });
+        }
+
+        // Cache the profile
+        await setCache(cacheKey, user, 600); // Cache for 10 minutes
+
+        res.status(200).json({
+            success: true,
+            data: user
+        });
+    } catch (error) {
+        console.error('Get profile error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+flRouter.put('/profile', authenticateToken, upload.single('profileImage'), async (req, res) => {
+    try {
+        const userId = req.user.userId;
+
+        // Update profile logic...
+        const result = await updateProfile(req, res);
+
+        // Invalidate cache
+        const cacheKey = `freelancer:profile:${userId}`;
+        await deleteCache(cacheKey);
+
+        return result;
+    } catch (error) {
+        console.error('Update profile error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
 // GET /api/freelancer/dashboard - Get dashboard data
 flRouter.get('/dashboard', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.userId;
+        const cacheKey = `freelancer:dashboard:${userId}`;
 
+        // Check cache
+        const cachedDashboard = await getCache(cacheKey);
+        if (cachedDashboard) {
+            return res.status(200).json({
+                success: true,
+                data: cachedDashboard
+            });
+        }
+
+        // Fetch dashboard data from database
         const freelancer = await prisma.freelancer.findUnique({
             where: { userId },
             include: {
-                user: {
-                    select: {
-                        name: true,
-                        email: true,
-                        profileImage: true
-                    }
-                },
-                assignedProjects: {
-                    include: {
-                        client: {
-                            include: {
-                                user: {
-                                    select: {
-                                        name: true,
-                                        profileImage: true
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    orderBy: {
-                        createdAt: 'desc'
-                    }
-                },
-                applications: {
-                    include: {
-                        project: {
-                            include: {
-                                client: {
-                                    include: {
-                                        user: {
-                                            select: {
-                                                name: true,
-                                                profileImage: true
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    orderBy: {
-                        createdAt: 'desc'
-                    },
-                    take: 5 // Latest 5 applications
-                }
+                assignedProjects: true,
+                applications: true
             }
         });
 
@@ -108,20 +139,18 @@ flRouter.get('/dashboard', authenticateToken, async (req, res) => {
             totalProjects: freelancer.projectsCompleted,
             activeProjects: freelancer.assignedProjects.filter(p => p.status === 'ASSIGNED').length,
             completedProjects: freelancer.assignedProjects.filter(p => p.status === 'COMPLETED').length,
-            rating: freelancer.ratings,
-            availability: freelancer.availability,
-            pendingApplications: freelancer.applications.filter(app => app.status === 'PENDING').length,
-            approvedApplications: freelancer.applications.filter(app => app.status === 'APPROVED').length
+            pendingApplications: freelancer.applications.filter(app => app.status === 'PENDING').length
         };
+
+        const dashboardData = { freelancer, stats };
+
+        // Cache the dashboard data
+        await setCache(cacheKey, dashboardData, 300); // Cache for 5 minutes
 
         res.status(200).json({
             success: true,
-            data: {
-                freelancer,
-                stats
-            }
+            data: dashboardData
         });
-
     } catch (error) {
         console.error('Dashboard error:', error);
         res.status(500).json({

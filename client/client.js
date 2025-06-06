@@ -10,6 +10,7 @@ import {
     getAllFreelancers
 } from "./auth.js";
 import { authenticateToken } from "../middleware/auth.js";
+import { setCache, getCache, deleteCache } from "../utils/redis.js";
 
 export const clientRouter = Router();
 
@@ -34,8 +35,77 @@ clientRouter.post('/signup', upload.single('profileImage'), signup);
 clientRouter.post('/login', login);
 
 // Profile Management Routes (Protected)
-clientRouter.get('/profile', authenticateToken, getProfile);
-clientRouter.put('/profile', authenticateToken, upload.single('profileImage'), updateProfile);
+clientRouter.get('/profile', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const cacheKey = `client:profile:${userId}`;
+
+        // Check cache
+        const cachedProfile = await getCache(cacheKey);
+        if (cachedProfile) {
+            return res.status(200).json({
+                success: true,
+                data: cachedProfile
+            });
+        }
+
+        // Fetch profile from database
+        const user = await prisma.user.findUnique({
+            where: { id: userId },
+            include: {
+                client: {
+                    include: {
+                        projects: true
+                    }
+                }
+            }
+        });
+
+        if (!user || user.role !== 'CLIENT') {
+            return res.status(404).json({
+                success: false,
+                message: 'Client not found'
+            });
+        }
+
+        // Cache the profile
+        await setCache(cacheKey, user, 600); // Cache for 10 minutes
+
+        res.status(200).json({
+            success: true,
+            data: user
+        });
+    } catch (error) {
+        console.error('Get profile error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+clientRouter.put('/profile', authenticateToken, upload.single('profileImage'), async (req, res) => {
+    try {
+        const userId = req.user.userId;
+
+        // Update profile logic...
+        const result = await updateProfile(req, res);
+
+        // Invalidate cache
+        const cacheKey = `client:profile:${userId}`;
+        await deleteCache(cacheKey);
+
+        return result;
+    } catch (error) {
+        console.error('Update profile error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
 
 // Freelancer Management Routes (Protected)
 clientRouter.get('/freelancers', authenticateToken, getAllFreelancers);
@@ -646,42 +716,24 @@ clientRouter.get('/applications', authenticateToken, async (req, res) => {
 clientRouter.get('/dashboard', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.userId;
-        
+        const cacheKey = `client:dashboard:${userId}`;
+
+        // Check cache
+        const cachedDashboard = await getCache(cacheKey);
+        if (cachedDashboard) {
+            return res.status(200).json({
+                success: true,
+                data: cachedDashboard
+            });
+        }
+
+        // Fetch dashboard data from database
         const client = await prisma.client.findUnique({
             where: { userId },
             include: {
-                user: {
-                    select: {
-                        name: true,
-                        email: true,
-                        profileImage: true
-                    }
-                },
                 projects: {
                     include: {
-                        freelancer: {
-                            include: {
-                                user: {
-                                    select: {
-                                        name: true,
-                                        profileImage: true
-                                    }
-                                }
-                            }
-                        },
-                        applications: {
-                            where: {
-                                status: 'PENDING'
-                            },
-                            select: {
-                                id: true,
-                                status: true,
-                                createdAt: true
-                            }
-                        }
-                    },
-                    orderBy: {
-                        createdAt: 'desc'
+                        applications: true
                     }
                 }
             }
@@ -699,18 +751,18 @@ clientRouter.get('/dashboard', authenticateToken, async (req, res) => {
             openProjects: client.projects.filter(p => p.status === 'OPEN').length,
             assignedProjects: client.projects.filter(p => p.status === 'ASSIGNED').length,
             completedProjects: client.projects.filter(p => p.status === 'COMPLETED').length,
-            rating: client.ratings,
             pendingApplications: client.projects.reduce((sum, project) => sum + project.applications.length, 0)
         };
 
+        const dashboardData = { client, stats };
+
+        // Cache the dashboard data
+        await setCache(cacheKey, dashboardData, 300); // Cache for 5 minutes
+
         res.status(200).json({
             success: true,
-            data: {
-                client,
-                stats
-            }
+            data: dashboardData
         });
-
     } catch (error) {
         console.error('Dashboard error:', error);
         res.status(500).json({
