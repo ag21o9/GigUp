@@ -349,17 +349,17 @@ export const getProfile = async (req, res) => {
 // GET /api/client/freelancers
 export const getAllFreelancers = async (req, res) => {
     try {
-        const { 
-            skills, 
-            minRating, 
-            location, 
-            availability, 
-            page = 1, 
-            limit = 10 
+        const {
+            skills,
+            minRating,
+            location,
+            availability,
+            page = 1,
+            limit = 10
         } = req.query;
-        
+
         const skip = (parseInt(page) - 1) * parseInt(limit);
-        
+
         const whereClause = {};
 
         // Filter by availability
@@ -390,10 +390,10 @@ export const getAllFreelancers = async (req, res) => {
         }
 
         const freelancers = await prisma.freelancer.findMany({
-            where: whereClause,
+
+            ...(whereClause.length != 0 && { where: whereClause }),
             include: {
                 user: {
-                    where: userWhereClause,
                     select: {
                         name: true,
                         email: true,

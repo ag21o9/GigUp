@@ -1,7 +1,7 @@
 import cloudinary from '../cloudinary.config.js';
 
 // Upload image to Cloudinary (handles Buffer and file paths)
-export const uploadImage = async (file, folder = 'freelance-app') => {
+export const uploadImage = async (file, folder = 'client-profiles') => {
     try {
         if (Buffer.isBuffer(file)) {
             // Handle Buffer uploads using upload_stream

@@ -6,12 +6,6 @@ let redisClient;
 const initializeRedis = async () => {
     if (!redisClient) {
         redisClient = await connectRedis();
-        redisClient.on('error', (err) => {
-            console.error('Redis Client Error:', err);
-        });
-        redisClient.on('connect', () => {
-            console.log('Redis client connected successfully');
-        });
     }
     return redisClient;
 };

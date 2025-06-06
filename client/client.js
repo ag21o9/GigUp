@@ -773,6 +773,161 @@ clientRouter.get('/dashboard', authenticateToken, async (req, res) => {
     }
 });
 
+// PUT /api/client/projects/:projectId/approve-completion - Approve project completion
+clientRouter.put('/projects/:projectId/approve-completion', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { projectId } = req.params;
+        const { feedback, rating } = req.body; // Optional: client feedback and rating
+
+        // Check if client exists
+        const client = await prisma.client.findUnique({
+            where: { userId }
+        });
+
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                message: 'Client not found'
+            });
+        }
+
+        // Check if project belongs to this client and is pending completion
+        const project = await prisma.project.findFirst({
+            where: {
+                id: projectId,
+                clientId: client.id,
+                status: 'PENDING_COMPLETION'
+            },
+            include: {
+                freelancer: true
+            }
+        });
+
+        if (!project) {
+            return res.status(404).json({
+                success: false,
+                message: 'Project not found or not pending completion'
+            });
+        }
+
+        // Update project status to COMPLETED and increment freelancer's completed projects
+        const updatedProject = await prisma.$transaction(async (tx) => {
+            // Update project status
+            const project = await tx.project.update({
+                where: { id: projectId },
+                data: { 
+                    status: 'COMPLETED',
+                    updatedAt: new Date()
+                }
+            });
+
+            // Update freelancer's completed projects count
+            await tx.freelancer.update({
+                where: { id: project.assignedTo },
+                data: {
+                    projectsCompleted: {
+                        increment: 1
+                    }
+                }
+            });
+
+            return project;
+        });
+
+        // Invalidate cache
+        await deleteCache(`client:projects:${userId}`);
+        await deleteCache(`freelancer:projects:${project.freelancer.userId}`);
+
+        res.status(200).json({
+            success: true,
+            message: 'Project completion approved successfully.',
+            data: updatedProject
+        });
+
+    } catch (error) {
+        console.error('Approve project completion error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// PUT /api/client/projects/:projectId/reject-completion - Reject project completion
+clientRouter.put('/projects/:projectId/reject-completion', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { projectId } = req.params;
+        const { rejectionReason } = req.body; // Required: reason for rejection
+
+        if (!rejectionReason) {
+            return res.status(400).json({
+                success: false,
+                message: 'Rejection reason is required'
+            });
+        }
+
+        // Check if client exists
+        const client = await prisma.client.findUnique({
+            where: { userId }
+        });
+
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                message: 'Client not found'
+            });
+        }
+
+        // Check if project belongs to this client and is pending completion
+        const project = await prisma.project.findFirst({
+            where: {
+                id: projectId,
+                clientId: client.id,
+                status: 'PENDING_COMPLETION'
+            }
+        });
+
+        if (!project) {
+            return res.status(404).json({
+                success: false,
+                message: 'Project not found or not pending completion'
+            });
+        }
+
+        // Update project status back to ASSIGNED (so freelancer can continue working)
+        const updatedProject = await prisma.project.update({
+            where: { id: projectId },
+            data: { 
+                status: 'ASSIGNED', // Back to assigned so freelancer can continue
+                updatedAt: new Date()
+            }
+        });
+
+        // Invalidate cache
+        await deleteCache(`client:projects:${userId}`);
+
+        res.status(200).json({
+            success: true,
+            message: 'Project completion request rejected. Freelancer has been notified.',
+            data: {
+                project: updatedProject,
+                rejectionReason
+            }
+        });
+
+    } catch (error) {
+        console.error('Reject project completion error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
 // Error handling middleware for multer
 clientRouter.use((error, req, res, next) => {
     if (error instanceof multer.MulterError) {

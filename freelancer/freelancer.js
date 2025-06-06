@@ -543,6 +543,84 @@ flRouter.get('/applications', authenticateToken, async (req, res) => {
     }
 });
 
+// PUT /api/freelancer/projects/:projectId/request-completion - Request project completion
+flRouter.put('/projects/:projectId/request-completion', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { projectId } = req.params;
+        const { deliverables, completionNote } = req.body; // Optional: deliverables and notes
+
+        // Check if freelancer exists
+        const freelancer = await prisma.freelancer.findUnique({
+            where: { userId }
+        });
+
+        if (!freelancer) {
+            return res.status(404).json({
+                success: false,
+                message: 'Freelancer not found'
+            });
+        }
+
+        // Check if project exists and is assigned to this freelancer
+        const project = await prisma.project.findFirst({
+            where: {
+                id: projectId,
+                assignedTo: freelancer.id,
+                status: 'ASSIGNED'
+            },
+            include: {
+                client: {
+                    include: {
+                        user: true
+                    }
+                }
+            }
+        });
+
+        if (!project) {
+            return res.status(404).json({
+                success: false,
+                message: 'Project not found, not assigned to you, or not in correct status'
+            });
+        }
+
+        // Update project status to PENDING_COMPLETION
+        const updatedProject = await prisma.project.update({
+            where: { id: projectId },
+            data: { 
+                status: 'PENDING_COMPLETION',
+                updatedAt: new Date()
+            },
+            include: {
+                client: {
+                    include: {
+                        user: true
+                    }
+                }
+            }
+        });
+
+        // Invalidate cache
+        await deleteCache(`freelancer:projects:${userId}`);
+        await deleteCache(`client:projects:${project.client.userId}`);
+
+        res.status(200).json({
+            success: true,
+            message: 'Completion request submitted. Awaiting client approval.',
+            data: updatedProject
+        });
+
+    } catch (error) {
+        console.error('Request project completion error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
 // Error handling middleware for multer
 flRouter.use((error, req, res, next) => {
     if (error instanceof multer.MulterError) {

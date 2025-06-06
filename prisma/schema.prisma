@@ -82,6 +82,7 @@ model Project {
   status         ProjectStatus @default(OPEN)
   assignedTo     String?
   createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt @default(now()) // Add this for tracking status changes
 
   // Relations
   client       Client        @relation(fields: [clientId], references: [id], onDelete: Cascade)
@@ -118,7 +119,9 @@ enum Role {
 enum ProjectStatus {
   OPEN
   ASSIGNED
+  PENDING_COMPLETION  // New: Freelancer requested completion, awaiting client approval
   COMPLETED
+  REJECTED_COMPLETION // New: Client rejected the completion request
   CANCELLED
 }
 
