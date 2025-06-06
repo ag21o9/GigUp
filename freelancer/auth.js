@@ -1,9 +1,7 @@
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { PrismaClient } from '../generated/prisma/index.js';
+import prisma from '../prisma.config.js';
 import { uploadImage, deleteImage } from '../utils/cloudinary.js';
-
-const prisma = new PrismaClient();
 
 // Helper function to generate JWT token
 const generateToken = (userId, role) => {
