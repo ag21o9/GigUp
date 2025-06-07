@@ -23,13 +23,29 @@ model User {
   profileImage String?
   bio          String?
   location     String?
+  isActive     Boolean  @default(true)  // New: For user suspension
   createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 
   // Relations
   freelancer Freelancer?
   client     Client?
+  admin      Admin?
 
   @@map("users")
+}
+
+model Admin {
+  id          String      @id @default(cuid())
+  userId      String      @unique
+  permissions AdminRole[] @default([MODERATOR])
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("admins")
 }
 
 model Freelancer {
@@ -45,6 +61,7 @@ model Freelancer {
   githubUrl         String?
   linkedinUrl       String?
   portfolioUrl      String?
+  isVerified        Boolean  @default(false) // New: Admin verification
 
   // Relations
   user             User          @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -62,6 +79,7 @@ model Client {
   projectsPosted Int     @default(0)
   ratings        Float   @default(0)
   website        String?
+  isVerified     Boolean @default(false) // New: Admin verification
 
   // Relations
   user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -81,8 +99,9 @@ model Project {
   duration       String?
   status         ProjectStatus @default(OPEN)
   assignedTo     String?
+  isFeatured     Boolean       @default(false) // New: Admin can feature projects
   createdAt      DateTime      @default(now())
-  updatedAt      DateTime      @updatedAt @default(now()) // Add this for tracking status changes
+  updatedAt      DateTime      @updatedAt
 
   // Relations
   client       Client        @relation(fields: [clientId], references: [id], onDelete: Cascade)
@@ -111,17 +130,39 @@ model Application {
   @@map("applications")
 }
 
+model Report {
+  id          String     @id @default(cuid())
+  reporterId  String     // User who made the report
+  reportedId  String     // User being reported
+  reportType  ReportType
+  reason      String
+  description String?
+  status      ReportStatus @default(PENDING)
+  adminNotes  String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@map("reports")
+}
+
 enum Role {
   CLIENT
   FREELANCER
+  ADMIN
+}
+
+enum AdminRole {
+  SUPER_ADMIN
+  MODERATOR
+  SUPPORT
 }
 
 enum ProjectStatus {
   OPEN
   ASSIGNED
-  PENDING_COMPLETION  // New: Freelancer requested completion, awaiting client approval
+  PENDING_COMPLETION
   COMPLETED
-  REJECTED_COMPLETION // New: Client rejected the completion request
+  REJECTED_COMPLETION
   CANCELLED
 }
 
@@ -129,4 +170,19 @@ enum ApplicationStatus {
   PENDING
   APPROVED
   REJECTED
+}
+
+enum ReportType {
+  USER_BEHAVIOR
+  INAPPROPRIATE_CONTENT
+  FRAUD
+  SPAM
+  OTHER
+}
+
+enum ReportStatus {
+  PENDING
+  INVESTIGATING
+  RESOLVED
+  DISMISSED
 }
