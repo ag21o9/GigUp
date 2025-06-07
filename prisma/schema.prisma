@@ -107,6 +107,7 @@ model Project {
   client       Client        @relation(fields: [clientId], references: [id], onDelete: Cascade)
   freelancer   Freelancer?   @relation(fields: [assignedTo], references: [id])
   applications Application[]
+  ratings      Rating[]
 
   @@map("projects")
 }
@@ -143,6 +144,25 @@ model Report {
   updatedAt   DateTime     @updatedAt
 
   @@map("reports")
+}
+
+model Rating {
+  id          String     @id @default(cuid())
+  projectId   String
+  raterId     String     // ID of user giving the rating
+  ratedId     String     // ID of user being rated
+  raterType   RaterType  // Who is giving the rating
+  rating      Int        // 1-5 star rating
+  review      String?    // Optional review text
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  // Relations
+  project     Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  // Prevent duplicate ratings for same project
+  @@unique([projectId, raterId, ratedId])
+  @@map("ratings")
 }
 
 enum Role {
@@ -185,4 +205,9 @@ enum ReportStatus {
   INVESTIGATING
   RESOLVED
   DISMISSED
+}
+
+enum RaterType {
+  CLIENT_TO_FREELANCER
+  FREELANCER_TO_CLIENT
 }

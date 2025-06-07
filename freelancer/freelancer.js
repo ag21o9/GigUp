@@ -615,6 +615,548 @@ flRouter.put('/projects/:projectId/request-completion', authenticateToken, check
     }
 });
 
+// POST /api/freelancer/projects/:projectId/rate-client - Rate a client after project completion
+flRouter.post('/projects/:projectId/rate-client', authenticateToken, checkFreelancerActive, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { projectId } = req.params;
+        const { rating, review } = req.body;
+
+        // Validation
+        if (!rating || rating < 1 || rating > 5) {
+            return res.status(400).json({
+                success: false,
+                message: 'Rating must be between 1 and 5 stars'
+            });
+        }
+
+        // Use freelancer from middleware
+        const freelancer = req.freelancer;
+
+        // Check if project exists, is completed, and was assigned to this freelancer
+        const project = await prisma.project.findFirst({
+            where: {
+                id: projectId,
+                assignedTo: freelancer.id,
+                status: 'COMPLETED'
+            },
+            include: {
+                client: {
+                    include: {
+                        user: true
+                    }
+                }
+            }
+        });
+
+        if (!project) {
+            return res.status(404).json({
+                success: false,
+                message: 'Project not found, not completed, or not assigned to you'
+            });
+        }
+
+        // Check if freelancer has already rated this client for this project
+        const existingRating = await prisma.rating.findUnique({
+            where: {
+                projectId_raterId_ratedId: {
+                    projectId,
+                    raterId: userId,
+                    ratedId: project.client.userId
+                }
+            }
+        });
+
+        if (existingRating) {
+            return res.status(400).json({
+                success: false,
+                message: 'You have already rated this client for this project'
+            });
+        }
+
+        // Create rating in transaction to update client's average rating
+        const result = await prisma.$transaction(async (tx) => {
+            // Create the rating
+            const newRating = await tx.rating.create({
+                data: {
+                    projectId,
+                    raterId: userId,
+                    ratedId: project.client.userId,
+                    raterType: 'FREELANCER_TO_CLIENT',
+                    rating: parseInt(rating),
+                    review
+                },
+                include: {
+                    project: {
+                        select: {
+                            title: true
+                        }
+                    }
+                }
+            });
+
+            // Calculate new average rating for the client
+            const clientRatings = await tx.rating.findMany({
+                where: {
+                    ratedId: project.client.userId,
+                    raterType: 'FREELANCER_TO_CLIENT'
+                },
+                select: {
+                    rating: true
+                }
+            });
+
+            const averageRating = clientRatings.reduce((sum, r) => sum + r.rating, 0) / clientRatings.length;
+
+            // Update client's average rating
+            await tx.client.update({
+                where: { id: project.clientId },
+                data: {
+                    ratings: parseFloat(averageRating.toFixed(2))
+                }
+            });
+
+            return newRating;
+        });
+
+        // Comprehensive cache invalidation
+        const cacheKeysToDelete = [
+            // Client related caches
+            `client:profile:${project.client.userId}`,
+            `client:ratings:${project.client.userId}:all`,
+            `client:ratings:${project.client.userId}:received`,
+            `client:ratings:${project.client.userId}:given`,
+            
+            // Freelancer related caches
+            `freelancer:ratings:${userId}:all`,
+            `freelancer:ratings:${userId}:given`,
+            `freelancer:ratings:${userId}:received`,
+            
+            // Public caches
+            `public:user:${project.client.userId}:ratings`,
+            `public:featured:freelancers`,
+            `public:featured:clients`,
+            
+            // Admin caches
+            `admin:dashboard:stats`
+        ];
+
+        // Delete all rating page caches for both users
+        for (let page = 1; page <= 10; page++) {
+            for (let limit of [10, 20, 50]) {
+                cacheKeysToDelete.push(
+                    `freelancer:ratings:${userId}:all:page:${page}:limit:${limit}`,
+                    `freelancer:ratings:${userId}:given:page:${page}:limit:${limit}`,
+                    `freelancer:ratings:${userId}:received:page:${page}:limit:${limit}`,
+                    `client:ratings:${project.client.userId}:all:page:${page}:limit:${limit}`,
+                    `client:ratings:${project.client.userId}:given:page:${page}:limit:${limit}`,
+                    `client:ratings:${project.client.userId}:received:page:${page}:limit:${limit}`
+                );
+            }
+        }
+
+        await Promise.all(cacheKeysToDelete.map(key => deleteCache(key)));
+
+        res.status(201).json({
+            success: true,
+            message: 'Client rated successfully',
+            data: result
+        });
+
+    } catch (error) {
+        console.error('Rate client error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// GET /api/freelancer/ratings - Get all ratings given and received by freelancer
+flRouter.get('/ratings', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { type = 'all', page = 1, limit = 10 } = req.query;
+
+        // Create specific cache key based on query parameters
+        const cacheKey = `freelancer:ratings:${userId}:${type}:page:${page}:limit:${limit}`;
+
+        // Check cache first
+        const cachedRatings = await getCache(cacheKey);
+        if (cachedRatings) {
+            return res.status(200).json({
+                success: true,
+                data: cachedRatings,
+                cached: true
+            });
+        }
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        const freelancer = await prisma.freelancer.findUnique({
+            where: { userId },
+            select: { id: true }
+        });
+
+        if (!freelancer) {
+            return res.status(404).json({
+                success: false,
+                message: 'Freelancer not found'
+            });
+        }
+
+        let whereClause = {};
+
+        if (type === 'given') {
+            // Ratings given by this freelancer to clients
+            whereClause = {
+                raterId: userId,
+                raterType: 'FREELANCER_TO_CLIENT'
+            };
+        } else if (type === 'received') {
+            // Ratings received by this freelancer from clients
+            whereClause = {
+                ratedId: userId,
+                raterType: 'CLIENT_TO_FREELANCER'
+            };
+        } else {
+            // All ratings (given and received)
+            whereClause = {
+                OR: [
+                    { raterId: userId },
+                    { ratedId: userId }
+                ]
+            };
+        }
+
+        const [ratings, totalRatings] = await Promise.all([
+            prisma.rating.findMany({
+                where: whereClause,
+                include: {
+                    project: {
+                        select: {
+                            title: true,
+                            client: {
+                                include: {
+                                    user: {
+                                        select: {
+                                            name: true,
+                                            profileImage: true
+                                        }
+                                    }
+                                }
+                            },
+                            freelancer: {
+                                include: {
+                                    user: {
+                                        select: {
+                                            name: true,
+                                            profileImage: true
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                orderBy: {
+                    createdAt: 'desc'
+                },
+                skip,
+                take: parseInt(limit)
+            }),
+            prisma.rating.count({ where: whereClause })
+        ]);
+
+        // Format the response
+        const formattedRatings = ratings.map(rating => ({
+            id: rating.id,
+            rating: rating.rating,
+            review: rating.review,
+            type: rating.raterType,
+            isGivenByMe: rating.raterId === userId,
+            project: {
+                title: rating.project.title
+            },
+            otherParty: rating.raterId === userId 
+                ? {
+                    name: rating.project.client.user.name,
+                    profileImage: rating.project.client.user.profileImage,
+                    role: 'CLIENT'
+                }
+                : {
+                    name: rating.project.freelancer?.user.name,
+                    profileImage: rating.project.freelancer?.user.profileImage,
+                    role: 'FREELANCER'
+                },
+            createdAt: rating.createdAt
+        }));
+
+        const responseData = {
+            ratings: formattedRatings,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total: totalRatings,
+                pages: Math.ceil(totalRatings / parseInt(limit))
+            }
+        };
+
+        // Cache the response for 15 minutes (ratings don't change frequently)
+        await setCache(cacheKey, responseData, 900);
+
+        res.status(200).json({
+            success: true,
+            data: responseData
+        });
+
+    } catch (error) {
+        console.error('Get freelancer ratings error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// PUT /api/freelancer/ratings/:ratingId - Update a rating given by freelancer
+flRouter.put('/ratings/:ratingId', authenticateToken, checkFreelancerActive, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { ratingId } = req.params;
+        const { rating, review } = req.body;
+
+        // Validation
+        if (rating && (rating < 1 || rating > 5)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Rating must be between 1 and 5 stars'
+            });
+        }
+
+        // Check if rating exists and was given by this freelancer
+        const existingRating = await prisma.rating.findFirst({
+            where: {
+                id: ratingId,
+                raterId: userId,
+                raterType: 'FREELANCER_TO_CLIENT'
+            },
+            include: {
+                project: {
+                    include: {
+                        client: true
+                    }
+                }
+            }
+        });
+
+        if (!existingRating) {
+            return res.status(404).json({
+                success: false,
+                message: 'Rating not found or you do not have permission to update it'
+            });
+        }
+
+        // Update rating in transaction to recalculate client's average rating
+        const result = await prisma.$transaction(async (tx) => {
+            // Update the rating
+            const updatedRating = await tx.rating.update({
+                where: { id: ratingId },
+                data: {
+                    ...(rating && { rating: parseInt(rating) }),
+                    ...(review !== undefined && { review }),
+                    updatedAt: new Date()
+                }
+            });
+
+            // Recalculate average rating for the client
+            const clientRatings = await tx.rating.findMany({
+                where: {
+                    ratedId: existingRating.project.client.userId,
+                    raterType: 'FREELANCER_TO_CLIENT'
+                },
+                select: {
+                    rating: true
+                }
+            });
+
+            const averageRating = clientRatings.reduce((sum, r) => sum + r.rating, 0) / clientRatings.length;
+
+            // Update client's average rating
+            await tx.client.update({
+                where: { id: existingRating.project.clientId },
+                data: {
+                    ratings: parseFloat(averageRating.toFixed(2))
+                }
+            });
+
+            return updatedRating;
+        });
+
+        // Comprehensive cache invalidation for rating updates
+        const cacheKeysToDelete = [
+            // Client related caches
+            `client:profile:${existingRating.project.client.userId}`,
+            
+            // Public caches
+            `public:user:${existingRating.project.client.userId}:ratings`,
+            `public:featured:freelancers`,
+            `public:featured:clients`
+        ];
+
+        // Delete all rating page caches for both users
+        for (let page = 1; page <= 10; page++) {
+            for (let limit of [10, 20, 50]) {
+                cacheKeysToDelete.push(
+                    `freelancer:ratings:${userId}:all:page:${page}:limit:${limit}`,
+                    `freelancer:ratings:${userId}:given:page:${page}:limit:${limit}`,
+                    `freelancer:ratings:${userId}:received:page:${page}:limit:${limit}`,
+                    `client:ratings:${existingRating.project.client.userId}:all:page:${page}:limit:${limit}`,
+                    `client:ratings:${existingRating.project.client.userId}:given:page:${page}:limit:${limit}`,
+                    `client:ratings:${existingRating.project.client.userId}:received:page:${page}:limit:${limit}`
+                );
+            }
+        }
+
+        await Promise.all(cacheKeysToDelete.map(key => deleteCache(key)));
+
+        res.status(200).json({
+            success: true,
+            message: 'Rating updated successfully',
+            data: result
+        });
+
+    } catch (error) {
+        console.error('Update rating error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// GET /api/freelancer/ratings/stats - Get rating statistics for freelancer
+flRouter.get('/ratings/stats', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const cacheKey = `freelancer:ratings:stats:${userId}`;
+
+        // Check cache first
+        const cachedStats = await getCache(cacheKey);
+        if (cachedStats) {
+            return res.status(200).json({
+                success: true,
+                data: cachedStats,
+                cached: true
+            });
+        }
+
+        const freelancer = await prisma.freelancer.findUnique({
+            where: { userId },
+            select: { id: true, ratings: true }
+        });
+
+        if (!freelancer) {
+            return res.status(404).json({
+                success: false,
+                message: 'Freelancer not found'
+            });
+        }
+
+        // Get detailed rating statistics
+        const [
+            receivedRatings,
+            givenRatings,
+            ratingDistribution
+        ] = await Promise.all([
+            // Ratings received from clients
+            prisma.rating.findMany({
+                where: {
+                    ratedId: userId,
+                    raterType: 'CLIENT_TO_FREELANCER'
+                },
+                select: {
+                    rating: true,
+                    createdAt: true
+                }
+            }),
+            // Ratings given to clients
+            prisma.rating.count({
+                where: {
+                    raterId: userId,
+                    raterType: 'FREELANCER_TO_CLIENT'
+                }
+            }),
+            // Rating distribution
+            prisma.rating.groupBy({
+                by: ['rating'],
+                where: {
+                    ratedId: userId,
+                    raterType: 'CLIENT_TO_FREELANCER'
+                },
+                _count: {
+                    rating: true
+                }
+            })
+        ]);
+
+        // Calculate statistics
+        const totalReceivedRatings = receivedRatings.length;
+        const averageRating = totalReceivedRatings > 0 
+            ? receivedRatings.reduce((sum, r) => sum + r.rating, 0) / totalReceivedRatings 
+            : 0;
+
+        // Create rating distribution object
+        const distribution = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+        ratingDistribution.forEach(item => {
+            distribution[item.rating] = item._count.rating;
+        });
+
+        // Calculate recent ratings (last 30 days)
+        const thirtyDaysAgo = new Date();
+        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+        
+        const recentRatings = receivedRatings.filter(
+            rating => new Date(rating.createdAt) >= thirtyDaysAgo
+        );
+
+        const statsData = {
+            overview: {
+                averageRating: parseFloat(averageRating.toFixed(2)),
+                totalReceived: totalReceivedRatings,
+                totalGiven: givenRatings,
+                recentRatingsCount: recentRatings.length
+            },
+            distribution,
+            recentTrend: {
+                last30Days: recentRatings.length,
+                averageLast30Days: recentRatings.length > 0 
+                    ? parseFloat((recentRatings.reduce((sum, r) => sum + r.rating, 0) / recentRatings.length).toFixed(2))
+                    : 0
+            }
+        };
+
+        // Cache for 30 minutes (stats don't change frequently)
+        await setCache(cacheKey, statsData, 1800);
+
+        res.status(200).json({
+            success: true,
+            data: statsData
+        });
+
+    } catch (error) {
+        console.error('Get rating stats error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
 // Error handling middleware for multer
 flRouter.use((error, req, res, next) => {
     if (error instanceof multer.MulterError) {

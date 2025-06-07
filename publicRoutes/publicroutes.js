@@ -591,3 +591,352 @@ publicRouter.get('/stats', async (req, res) => {
         });
     }
 });
+
+// GET /api/public/users/:userId/ratings - Get public ratings for any user (freelancer or client)
+publicRouter.get('/users/:userId/ratings', async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const { page = 1, limit = 10 } = req.query;
+
+        // Validate pagination parameters
+        const pageNum = Math.max(1, parseInt(page));
+        const limitNum = Math.min(50, Math.max(1, parseInt(limit))); // Max 50 items per page
+        const skip = (pageNum - 1) * limitNum;
+
+        // Create cache key
+        const cacheKey = `public:user:${userId}:ratings:page:${pageNum}:limit:${limitNum}`;
+
+        // Check cache first
+        const cachedData = await getCache(cacheKey);
+        if (cachedData) {
+            return res.status(200).json({
+                success: true,
+                data: cachedData,
+                cached: true
+            });
+        }
+
+        // Check if user exists and get their basic info
+        const user = await prisma.user.findUnique({
+            where: { 
+                id: userId,
+                isActive: true // Only show ratings for active users
+            },
+            select: {
+                id: true,
+                name: true,
+                role: true,
+                profileImage: true
+            }
+        });
+
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                message: 'User not found or account is inactive'
+            });
+        }
+
+        // Determine rating type based on user role
+        let whereClause = {};
+        let raterType = '';
+
+        if (user.role === 'FREELANCER') {
+            // For freelancers, show ratings received from clients
+            whereClause = {
+                ratedId: userId,
+                raterType: 'CLIENT_TO_FREELANCER'
+            };
+            raterType = 'CLIENT_TO_FREELANCER';
+        } else if (user.role === 'CLIENT') {
+            // For clients, show ratings received from freelancers
+            whereClause = {
+                ratedId: userId,
+                raterType: 'FREELANCER_TO_CLIENT'
+            };
+            raterType = 'FREELANCER_TO_CLIENT';
+        } else {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid user role for ratings'
+            });
+        }
+
+        // Get ratings, total count, and statistics in parallel
+        const [ratings, totalRatings, avgRatingData, ratingDistribution] = await Promise.all([
+            // Get paginated ratings
+            prisma.rating.findMany({
+                where: whereClause,
+                select: {
+                    id: true,
+                    rating: true,
+                    review: true,
+                    createdAt: true,
+                    project: {
+                        select: {
+                            title: true
+                        }
+                    }
+                },
+                orderBy: {
+                    createdAt: 'desc'
+                },
+                skip,
+                take: limitNum
+            }),
+            
+            // Get total count
+            prisma.rating.count({ 
+                where: whereClause 
+            }),
+            
+            // Get average rating
+            prisma.rating.aggregate({
+                where: whereClause,
+                _avg: {
+                    rating: true
+                },
+                _count: {
+                    rating: true
+                }
+            }),
+            
+            // Get rating distribution
+            prisma.rating.groupBy({
+                by: ['rating'],
+                where: whereClause,
+                _count: {
+                    rating: true
+                }
+            })
+        ]);
+
+        // Format ratings (remove rater information for privacy)
+        const formattedRatings = ratings.map(rating => ({
+            id: rating.id,
+            rating: rating.rating,
+            review: rating.review,
+            project: {
+                title: rating.project.title
+            },
+            createdAt: rating.createdAt
+        }));
+
+        // Create rating distribution object
+        const distribution = {
+            1: 0,
+            2: 0,
+            3: 0,
+            4: 0,
+            5: 0
+        };
+
+        ratingDistribution.forEach(item => {
+            distribution[item.rating] = item._count.rating;
+        });
+
+        // Calculate additional statistics
+        const averageRating = avgRatingData._avg.rating ? parseFloat(avgRatingData._avg.rating.toFixed(2)) : 0;
+        const totalRatingsCount = avgRatingData._count.rating;
+
+        // Calculate percentage for each rating
+        const distributionWithPercentage = {};
+        Object.keys(distribution).forEach(star => {
+            const count = distribution[star];
+            const percentage = totalRatingsCount > 0 ? ((count / totalRatingsCount) * 100).toFixed(1) : 0;
+            distributionWithPercentage[star] = {
+                count,
+                percentage: parseFloat(percentage)
+            };
+        });
+
+        const responseData = {
+            user: {
+                id: user.id,
+                name: user.name,
+                role: user.role,
+                profileImage: user.profileImage
+            },
+            ratings: formattedRatings,
+            statistics: {
+                averageRating,
+                totalRatings: totalRatingsCount,
+                distribution: distributionWithPercentage,
+                ratingBreakdown: {
+                    excellent: distribution[5], // 5 star
+                    good: distribution[4],      // 4 star
+                    average: distribution[3],   // 3 star
+                    poor: distribution[2],      // 2 star
+                    terrible: distribution[1]   // 1 star
+                }
+            },
+            pagination: {
+                page: pageNum,
+                limit: limitNum,
+                total: totalRatings,
+                pages: Math.ceil(totalRatings / limitNum),
+                hasNext: pageNum * limitNum < totalRatings,
+                hasPrev: pageNum > 1
+            }
+        };
+
+        // Cache for 20 minutes (public data, less frequent updates)
+        await setCache(cacheKey, responseData, 1200);
+
+        res.status(200).json({
+            success: true,
+            data: responseData
+        });
+
+    } catch (error) {
+        console.error('Get public user ratings error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// GET /api/public/users/:userId/ratings/summary - Get condensed rating summary
+publicRouter.get('/users/:userId/ratings/summary', async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const cacheKey = `public:user:${userId}:ratings:summary`;
+
+        // Check cache first
+        const cachedData = await getCache(cacheKey);
+        if (cachedData) {
+            return res.status(200).json({
+                success: true,
+                data: cachedData,
+                cached: true
+            });
+        }
+
+        // Check if user exists
+        const user = await prisma.user.findUnique({
+            where: { 
+                id: userId,
+                isActive: true
+            },
+            select: {
+                id: true,
+                name: true,
+                role: true,
+                profileImage: true
+            }
+        });
+
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                message: 'User not found or account is inactive'
+            });
+        }
+
+        // Determine rating type based on user role
+        let whereClause = {};
+        if (user.role === 'FREELANCER') {
+            whereClause = {
+                ratedId: userId,
+                raterType: 'CLIENT_TO_FREELANCER'
+            };
+        } else if (user.role === 'CLIENT') {
+            whereClause = {
+                ratedId: userId,
+                raterType: 'FREELANCER_TO_CLIENT'
+            };
+        } else {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid user role for ratings'
+            });
+        }
+
+        // Get rating statistics and recent ratings
+        const [avgRatingData, ratingDistribution, recentRatings] = await Promise.all([
+            prisma.rating.aggregate({
+                where: whereClause,
+                _avg: {
+                    rating: true
+                },
+                _count: {
+                    rating: true
+                }
+            }),
+            
+            prisma.rating.groupBy({
+                by: ['rating'],
+                where: whereClause,
+                _count: {
+                    rating: true
+                }
+            }),
+
+            // Get 3 most recent ratings
+            prisma.rating.findMany({
+                where: whereClause,
+                select: {
+                    rating: true,
+                    review: true,
+                    createdAt: true,
+                    project: {
+                        select: {
+                            title: true
+                        }
+                    }
+                },
+                orderBy: {
+                    createdAt: 'desc'
+                },
+                take: 3
+            })
+        ]);
+
+        // Create rating distribution
+        const distribution = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+        ratingDistribution.forEach(item => {
+            distribution[item.rating] = item._count.rating;
+        });
+
+        const averageRating = avgRatingData._avg.rating ? parseFloat(avgRatingData._avg.rating.toFixed(2)) : 0;
+        const totalRatings = avgRatingData._count.rating;
+
+        const responseData = {
+            user: {
+                id: user.id,
+                name: user.name,
+                role: user.role,
+                profileImage: user.profileImage
+            },
+            summary: {
+                averageRating,
+                totalRatings,
+                starDistribution: distribution,
+                recentRatings: recentRatings.map(rating => ({
+                    rating: rating.rating,
+                    review: rating.review ? rating.review.substring(0, 100) + (rating.review.length > 100 ? '...' : '') : null,
+                    projectTitle: rating.project.title,
+                    createdAt: rating.createdAt
+                }))
+            }
+        };
+
+        // Cache for 30 minutes (summary data)
+        await setCache(cacheKey, responseData, 1800);
+
+        res.status(200).json({
+            success: true,
+            data: responseData
+        });
+
+    } catch (error) {
+        console.error('Get user ratings summary error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});

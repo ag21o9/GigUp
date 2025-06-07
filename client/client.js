@@ -928,6 +928,360 @@ clientRouter.put('/projects/:projectId/reject-completion', authenticateToken, as
     }
 });
 
+// POST /api/client/projects/:projectId/rate-freelancer - Rate a freelancer after project completion
+clientRouter.post('/projects/:projectId/rate-freelancer', authenticateToken, checkClientActive, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { projectId } = req.params;
+        const { rating, review } = req.body;
+
+        // Validation
+        if (!rating || rating < 1 || rating > 5) {
+            return res.status(400).json({
+                success: false,
+                message: 'Rating must be between 1 and 5 stars'
+            });
+        }
+
+        // Use client from middleware
+        const client = req.client;
+
+        // Check if project exists, is completed, and belongs to this client
+        const project = await prisma.project.findFirst({
+            where: {
+                id: projectId,
+                clientId: client.id,
+                status: 'COMPLETED'
+            },
+            include: {
+                freelancer: {
+                    include: {
+                        user: true
+                    }
+                }
+            }
+        });
+
+        if (!project) {
+            return res.status(404).json({
+                success: false,
+                message: 'Project not found, not completed, or does not belong to you'
+            });
+        }
+
+        if (!project.freelancer) {
+            return res.status(400).json({
+                success: false,
+                message: 'No freelancer assigned to this project'
+            });
+        }
+
+        // Check if client has already rated this freelancer for this project
+        const existingRating = await prisma.rating.findUnique({
+            where: {
+                projectId_raterId_ratedId: {
+                    projectId,
+                    raterId: userId,
+                    ratedId: project.freelancer.userId
+                }
+            }
+        });
+
+        if (existingRating) {
+            return res.status(400).json({
+                success: false,
+                message: 'You have already rated this freelancer for this project'
+            });
+        }
+
+        // Create rating in transaction to update freelancer's average rating
+        const result = await prisma.$transaction(async (tx) => {
+            // Create the rating
+            const newRating = await tx.rating.create({
+                data: {
+                    projectId,
+                    raterId: userId,
+                    ratedId: project.freelancer.userId,
+                    raterType: 'CLIENT_TO_FREELANCER',
+                    rating: parseInt(rating),
+                    review
+                },
+                include: {
+                    project: {
+                        select: {
+                            title: true
+                        }
+                    }
+                }
+            });
+
+            // Calculate new average rating for the freelancer
+            const freelancerRatings = await tx.rating.findMany({
+                where: {
+                    ratedId: project.freelancer.userId,
+                    raterType: 'CLIENT_TO_FREELANCER'
+                },
+                select: {
+                    rating: true
+                }
+            });
+
+            const averageRating = freelancerRatings.reduce((sum, r) => sum + r.rating, 0) / freelancerRatings.length;
+
+            // Update freelancer's average rating
+            await tx.freelancer.update({
+                where: { id: project.assignedTo },
+                data: {
+                    ratings: parseFloat(averageRating.toFixed(2))
+                }
+            });
+
+            return newRating;
+        });
+
+        // Invalidate relevant caches
+        await deleteCache(`freelancer:profile:${project.freelancer.userId}`);
+        await deleteCache(`public:featured:freelancers`);
+
+        res.status(201).json({
+            success: true,
+            message: 'Freelancer rated successfully',
+            data: result
+        });
+
+    } catch (error) {
+        console.error('Rate freelancer error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// GET /api/client/ratings - Get all ratings given and received by client
+clientRouter.get('/ratings', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { type = 'all', page = 1, limit = 10 } = req.query;
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        const client = await prisma.client.findUnique({
+            where: { userId },
+            select: { id: true }
+        });
+
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                message: 'Client not found'
+            });
+        }
+
+        let whereClause = {};
+
+        if (type === 'given') {
+            // Ratings given by this client to freelancers
+            whereClause = {
+                raterId: userId,
+                raterType: 'CLIENT_TO_FREELANCER'
+            };
+        } else if (type === 'received') {
+            // Ratings received by this client from freelancers
+            whereClause = {
+                ratedId: userId,
+                raterType: 'FREELANCER_TO_CLIENT'
+            };
+        } else {
+            // All ratings (given and received)
+            whereClause = {
+                OR: [
+                    { raterId: userId },
+                    { ratedId: userId }
+                ]
+            };
+        }
+
+        const [ratings, totalRatings] = await Promise.all([
+            prisma.rating.findMany({
+                where: whereClause,
+                include: {
+                    project: {
+                        select: {
+                            title: true,
+                            client: {
+                                include: {
+                                    user: {
+                                        select: {
+                                            name: true,
+                                            profileImage: true
+                                        }
+                                    }
+                                }
+                            },
+                            freelancer: {
+                                include: {
+                                    user: {
+                                        select: {
+                                            name: true,
+                                            profileImage: true
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                orderBy: {
+                    createdAt: 'desc'
+                },
+                skip,
+                take: parseInt(limit)
+            }),
+            prisma.rating.count({ where: whereClause })
+        ]);
+
+        // Format the response
+        const formattedRatings = ratings.map(rating => ({
+            id: rating.id,
+            rating: rating.rating,
+            review: rating.review,
+            type: rating.raterType,
+            isGivenByMe: rating.raterId === userId,
+            project: {
+                title: rating.project.title
+            },
+            otherParty: rating.raterId === userId 
+                ? {
+                    name: rating.project.freelancer?.user.name,
+                    profileImage: rating.project.freelancer?.user.profileImage,
+                    role: 'FREELANCER'
+                }
+                : {
+                    name: rating.project.client.user.name,
+                    profileImage: rating.project.client.user.profileImage,
+                    role: 'CLIENT'
+                },
+            createdAt: rating.createdAt
+        }));
+
+        res.status(200).json({
+            success: true,
+            data: {
+                ratings: formattedRatings,
+                pagination: {
+                    page: parseInt(page),
+                    limit: parseInt(limit),
+                    total: totalRatings,
+                    pages: Math.ceil(totalRatings / parseInt(limit))
+                }
+            }
+        });
+
+    } catch (error) {
+        console.error('Get client ratings error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// PUT /api/client/ratings/:ratingId - Update a rating given by client
+clientRouter.put('/ratings/:ratingId', authenticateToken, checkClientActive, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { ratingId } = req.params;
+        const { rating, review } = req.body;
+
+        // Validation
+        if (rating && (rating < 1 || rating > 5)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Rating must be between 1 and 5 stars'
+            });
+        }
+
+        // Check if rating exists and was given by this client
+        const existingRating = await prisma.rating.findFirst({
+            where: {
+                id: ratingId,
+                raterId: userId,
+                raterType: 'CLIENT_TO_FREELANCER'
+            },
+            include: {
+                project: {
+                    include: {
+                        freelancer: true
+                    }
+                }
+            }
+        });
+
+        if (!existingRating) {
+            return res.status(404).json({
+                success: false,
+                message: 'Rating not found or you do not have permission to update it'
+            });
+        }
+
+        // Update rating in transaction to recalculate freelancer's average rating
+        const result = await prisma.$transaction(async (tx) => {
+            // Update the rating
+            const updatedRating = await tx.rating.update({
+                where: { id: ratingId },
+                data: {
+                    ...(rating && { rating: parseInt(rating) }),
+                    ...(review !== undefined && { review }),
+                    updatedAt: new Date()
+                }
+            });
+
+            // Recalculate average rating for the freelancer
+            const freelancerRatings = await tx.rating.findMany({
+                where: {
+                    ratedId: existingRating.project.freelancer.userId,
+                    raterType: 'CLIENT_TO_FREELANCER'
+                },
+                select: {
+                    rating: true
+                }
+            });
+
+            const averageRating = freelancerRatings.reduce((sum, r) => sum + r.rating, 0) / freelancerRatings.length;
+
+            // Update freelancer's average rating
+            await tx.freelancer.update({
+                where: { id: existingRating.project.assignedTo },
+                data: {
+                    ratings: parseFloat(averageRating.toFixed(2))
+                }
+            });
+
+            return updatedRating;
+        });
+
+        // Invalidate relevant caches
+        await deleteCache(`freelancer:profile:${existingRating.project.freelancer.userId}`);
+
+        res.status(200).json({
+            success: true,
+            message: 'Rating updated successfully',
+            data: result
+        });
+
+    } catch (error) {
+        console.error('Update rating error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
 // Error handling middleware for multer
 clientRouter.use((error, req, res, next) => {
     if (error instanceof multer.MulterError) {
