@@ -9,7 +9,7 @@ import {
     getProfile,
     getAllFreelancers
 } from "./auth.js";
-import { authenticateToken } from "../middleware/auth.js";
+import { authenticateToken, checkClientActive } from "../middleware/auth.js";
 import { setCache, getCache, deleteCache } from "../utils/redis.js";
 
 export const clientRouter = Router();
@@ -112,7 +112,7 @@ clientRouter.get('/freelancers', authenticateToken, getAllFreelancers);
 
 // Project Management Routes (Protected)
 // POST /api/client/projects - Create a new project
-clientRouter.post('/projects', authenticateToken, async (req, res) => {
+clientRouter.post('/projects', authenticateToken, checkClientActive, async (req, res) => {
     try {
         const userId = req.user.userId;
         const {
@@ -383,7 +383,7 @@ clientRouter.get('/projects/:projectId/applications', authenticateToken, async (
 });
 
 // PUT /api/client/projects/:projectId/applications/:applicationId/approve - Approve an application
-clientRouter.put('/projects/:projectId/applications/:applicationId/approve', authenticateToken, async (req, res) => {
+clientRouter.put('/projects/:projectId/applications/:applicationId/approve', authenticateToken, checkClientActive, async (req, res) => {
     try {
         const userId = req.user.userId;
         const { projectId, applicationId } = req.params;

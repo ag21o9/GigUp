@@ -8,9 +8,8 @@ import {
     updateAvailability
 } from "./auth.js";
 
-import { authenticateToken } from "../middleware/auth.js";
+import { authenticateToken, checkFreelancerActive } from "../middleware/auth.js";
 import { setCache, getCache, deleteCache } from "../utils/redis.js";
-
 import prisma from "../prisma.config.js";
 
 export const flRouter = Router();
@@ -82,7 +81,7 @@ flRouter.get('/profile', authenticateToken, async (req, res) => {
     }
 });
 
-flRouter.put('/profile', authenticateToken, upload.single('profileImage'), async (req, res) => {
+flRouter.put('/profile', authenticateToken, checkFreelancerActive, upload.single('profileImage'), async (req, res) => {
     try {
         const userId = req.user.userId;
 
@@ -124,7 +123,12 @@ flRouter.get('/dashboard', authenticateToken, async (req, res) => {
             where: { userId },
             include: {
                 assignedProjects: true,
-                applications: true
+                applications: true,
+                user: {
+                    select: {
+                        isActive: true
+                    }
+                }
             }
         });
 
@@ -139,7 +143,8 @@ flRouter.get('/dashboard', authenticateToken, async (req, res) => {
             totalProjects: freelancer.projectsCompleted,
             activeProjects: freelancer.assignedProjects.filter(p => p.status === 'ASSIGNED').length,
             completedProjects: freelancer.assignedProjects.filter(p => p.status === 'COMPLETED').length,
-            pendingApplications: freelancer.applications.filter(app => app.status === 'PENDING').length
+            pendingApplications: freelancer.applications.filter(app => app.status === 'PENDING').length,
+            accountStatus: freelancer.user.isActive ? 'active' : 'suspended'
         };
 
         const dashboardData = { freelancer, stats };
@@ -229,25 +234,15 @@ flRouter.get('/projects', authenticateToken, async (req, res) => {
 });
 
 // GET /api/freelancer/projects/available - Get available projects for freelancer
-flRouter.get('/projects/available', authenticateToken, async (req, res) => {
+flRouter.get('/projects/available', authenticateToken, checkFreelancerActive, async (req, res) => {
     try {
         const userId = req.user.userId;
         const { skills, budgetMin, budgetMax, page = 1, limit = 10 } = req.query;
 
         const skip = (parseInt(page) - 1) * parseInt(limit);
 
-        // Get freelancer's skills for filtering
-        const freelancer = await prisma.freelancer.findUnique({
-            where: { userId },
-            select: { skills: true, id: true }
-        });
-
-        if (!freelancer) {
-            return res.status(404).json({
-                success: false,
-                message: 'Freelancer not found'
-            });
-        }
+        // Use freelancer from middleware
+        const freelancer = req.freelancer;
 
         const whereClause = {
             status: 'OPEN',
@@ -330,23 +325,14 @@ flRouter.get('/projects/available', authenticateToken, async (req, res) => {
 });
 
 // POST /api/freelancer/projects/:projectId/apply - Apply for a project
-flRouter.post('/projects/:projectId/apply', authenticateToken, async (req, res) => {
+flRouter.post('/projects/:projectId/apply', authenticateToken, checkFreelancerActive, async (req, res) => {
     try {
         const userId = req.user.userId;
         const { projectId } = req.params;
         const { proposal, coverLetter } = req.body;
 
-        // Check if freelancer exists and is available
-        const freelancer = await prisma.freelancer.findUnique({
-            where: { userId }
-        });
-
-        if (!freelancer) {
-            return res.status(404).json({
-                success: false,
-                message: 'Freelancer not found'
-            });
-        }
+        // Use freelancer from middleware
+        const freelancer = req.freelancer;
 
         if (!freelancer.availability) {
             return res.status(400).json({
@@ -364,7 +350,8 @@ flRouter.post('/projects/:projectId/apply', authenticateToken, async (req, res) 
                         user: {
                             select: {
                                 name: true,
-                                profileImage: true
+                                profileImage: true,
+                                isActive: true
                             }
                         }
                     }
@@ -376,6 +363,14 @@ flRouter.post('/projects/:projectId/apply', authenticateToken, async (req, res) 
             return res.status(404).json({
                 success: false,
                 message: 'Project not found'
+            });
+        }
+
+        // Check if client is also active
+        if (!project.client.user.isActive) {
+            return res.status(400).json({
+                success: false,
+                message: 'This project is no longer available'
             });
         }
 
@@ -544,23 +539,14 @@ flRouter.get('/applications', authenticateToken, async (req, res) => {
 });
 
 // PUT /api/freelancer/projects/:projectId/request-completion - Request project completion
-flRouter.put('/projects/:projectId/request-completion', authenticateToken, async (req, res) => {
+flRouter.put('/projects/:projectId/request-completion', authenticateToken, checkFreelancerActive, async (req, res) => {
     try {
         const userId = req.user.userId;
         const { projectId } = req.params;
-        const { deliverables, completionNote } = req.body; // Optional: deliverables and notes
+        const { deliverables, completionNote } = req.body;
 
-        // Check if freelancer exists
-        const freelancer = await prisma.freelancer.findUnique({
-            where: { userId }
-        });
-
-        if (!freelancer) {
-            return res.status(404).json({
-                success: false,
-                message: 'Freelancer not found'
-            });
-        }
+        // Use freelancer from middleware
+        const freelancer = req.freelancer;
 
         // Check if project exists and is assigned to this freelancer
         const project = await prisma.project.findFirst({
@@ -582,6 +568,14 @@ flRouter.put('/projects/:projectId/request-completion', authenticateToken, async
             return res.status(404).json({
                 success: false,
                 message: 'Project not found, not assigned to you, or not in correct status'
+            });
+        }
+
+        // Check if client is still active
+        if (!project.client.user.isActive) {
+            return res.status(400).json({
+                success: false,
+                message: 'Cannot request completion. Client account is inactive.'
             });
         }
 

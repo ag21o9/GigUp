@@ -58,6 +58,12 @@ publicRouter.get('/freelancers', async (req, res) => {
             };
         }
 
+        // Add to whereClause
+        whereClause.user = {
+            ...whereClause.user,
+            isActive: true // Only show active freelancers
+        };
+
         const freelancers = await prisma.freelancer.findMany({
             where: whereClause,
             include: {
@@ -187,7 +193,12 @@ publicRouter.get('/jobs', async (req, res) => {
         }
 
         const whereClause = {
-            status: 'OPEN' // Only show open projects
+            status: 'OPEN',
+            client: {
+                user: {
+                    isActive: true // Only show projects from active clients
+                }
+            }
         };
 
         // Filter by skills
