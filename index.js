@@ -8,7 +8,7 @@ const prisma = new PrismaClient();
 
 import { flRouter } from './freelancer/freelancer.js';
 import { clientRouter } from './client/client.js';
-
+import { publicRouter } from './publicRoutes/publicroutes.js';
 const PORT = process.env.PORT || 3000;
 const app = express();
 
@@ -22,7 +22,8 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 app.use('/api/v1/freelancer', flRouter);
-app.use('/api/v1/client', clientRouter)
+app.use('/api/v1/client', clientRouter);
+app.use('/api/v1/public', publicRouter);
 
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
