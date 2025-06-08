@@ -30,6 +30,40 @@ const upload = multer({
     }
 });
 
+// Add this helper function at the top of your client.js file
+
+const invalidateClientCaches = async (userId, clientId = null) => {
+    const cacheKeysToDelete = [
+        // Client specific caches
+        `client:profile:${userId}`,
+        `client:dashboard:${userId}`,
+        
+        // Public caches
+        'public:projects:available',
+        'public:projects:recent',
+        'public:featured:projects',
+        'admin:dashboard:stats'
+    ];
+
+    // Add project-related caches with different filters
+    const statuses = ['all', 'OPEN', 'ASSIGNED', 'COMPLETED'];
+    const pages = Array.from({length: 5}, (_, i) => i + 1);
+    const limits = [10, 20, 50];
+
+    for (const status of statuses) {
+        for (const page of pages) {
+            for (const limit of limits) {
+                cacheKeysToDelete.push(
+                    `client:projects:${userId}:status:${status}:page:${page}:limit:${limit}`
+                );
+            }
+        }
+    }
+
+    // Delete all caches
+    await Promise.all(cacheKeysToDelete.map(key => deleteCache(key)));
+};
+
 // Authentication Routes (Public)
 clientRouter.post('/signup', upload.single('profileImage'), signup);
 clientRouter.post('/login', login);
@@ -179,6 +213,38 @@ clientRouter.post('/projects', authenticateToken, checkClientActive, async (req,
             }
         });
 
+        // COMPREHENSIVE CACHE INVALIDATION - Add this section
+        const cacheKeysToDelete = [
+            // Client specific caches
+            `client:profile:${userId}`,
+            `client:dashboard:${userId}`,
+            `client:projects:${userId}`,
+            
+            // Public caches that might show this project
+            `public:projects:available`,
+            `public:projects:recent`,
+            `public:featured:projects`,
+            
+            // Admin dashboard cache
+            `admin:dashboard:stats`,
+            
+            // Any cached project lists with pagination
+            ...Array.from({length: 10}, (_, i) => `client:projects:${userId}:page:${i + 1}`),
+            ...Array.from({length: 10}, (_, i) => `public:projects:page:${i + 1}`),
+        ];
+
+        // Delete all relevant caches
+        await Promise.all(cacheKeysToDelete.map(key => deleteCache(key)));
+
+        // Also invalidate pattern-based caches (if you have wildcard deletion)
+        try {
+            // Delete all project-related caches for this client
+            await deleteCache(`client:projects:${userId}:*`);
+            await deleteCache(`public:projects:*`);
+        } catch (error) {
+            console.log('Pattern cache deletion not supported, using individual deletion');
+        }
+
         res.status(201).json({
             success: true,
             message: 'Project created successfully',
@@ -201,6 +267,19 @@ clientRouter.get('/projects', authenticateToken, async (req, res) => {
         const userId = req.user.userId;
         const { status, page = 1, limit = 10 } = req.query;
         
+        // Create cache key based on query parameters
+        const cacheKey = `client:projects:${userId}:status:${status || 'all'}:page:${page}:limit:${limit}`;
+        
+        // Check cache first (shorter duration)
+        const cachedProjects = await getCache(cacheKey);
+        if (cachedProjects) {
+            return res.status(200).json({
+                success: true,
+                data: cachedProjects,
+                cached: true
+            });
+        }
+        
         const skip = (parseInt(page) - 1) * parseInt(limit);
         
         const client = await prisma.client.findUnique({
@@ -222,50 +301,69 @@ clientRouter.get('/projects', authenticateToken, async (req, res) => {
             whereClause.status = status.toUpperCase();
         }
 
-        const projects = await prisma.project.findMany({
-            where: whereClause,
-            include: {
-                freelancer: {
-                    include: {
-                        user: {
-                            select: {
-                                name: true,
-                                email: true,
-                                profileImage: true
+        const [projects, totalProjects] = await Promise.all([
+            prisma.project.findMany({
+                where: whereClause,
+                include: {
+                    freelancer: {
+                        include: {
+                            user: {
+                                select: {
+                                    name: true,
+                                    email: true,
+                                    profileImage: true
+                                }
+                            }
+                        }
+                    },
+                    applications: {
+                        where: {
+                            status: 'PENDING'
+                        },
+                        select: {
+                            id: true,
+                            status: true,
+                            createdAt: true,
+                            freelancer: {
+                                select: {
+                                    user: {
+                                        select: {
+                                            name: true,
+                                            profileImage: true
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 },
-                applications: {
-                    select: {
-                        id: true,
-                        status: true,
-                        createdAt: true
-                    }
-                }
-            },
-            orderBy: {
-                createdAt: 'desc'
-            },
-            skip,
-            take: parseInt(limit)
-        });
+                orderBy: {
+                    createdAt: 'desc'
+                },
+                skip,
+                take: parseInt(limit)
+            }),
+            prisma.project.count({
+                where: whereClause
+            })
+        ]);
 
-        const totalProjects = await prisma.project.count({
-            where: whereClause
-        });
+        const responseData = {
+            projects,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total: totalProjects,
+                pages: Math.ceil(totalProjects / parseInt(limit))
+            }
+        };
+
+        // Cache for shorter duration (3 minutes)
+        await setCache(cacheKey, responseData, 180);
 
         res.status(200).json({
             success: true,
-            data: {
-                projects,
-                pagination: {
-                    page: parseInt(page),
-                    limit: parseInt(limit),
-                    total: totalProjects,
-                    pages: Math.ceil(totalProjects / parseInt(limit))
-                }
-            }
+            data: responseData
         });
 
     } catch (error) {
@@ -718,12 +816,13 @@ clientRouter.get('/dashboard', authenticateToken, async (req, res) => {
         const userId = req.user.userId;
         const cacheKey = `client:dashboard:${userId}`;
 
-        // Check cache
+        // Check cache with shorter duration
         const cachedDashboard = await getCache(cacheKey);
         if (cachedDashboard) {
             return res.status(200).json({
                 success: true,
-                data: cachedDashboard
+                data: cachedDashboard,
+                cached: true
             });
         }
 
@@ -733,7 +832,24 @@ clientRouter.get('/dashboard', authenticateToken, async (req, res) => {
             include: {
                 projects: {
                     include: {
-                        applications: true
+                        applications: {
+                            where: {
+                                status: 'PENDING'
+                            }
+                        },
+                        freelancer: {
+                            select: {
+                                user: {
+                                    select: {
+                                        name: true,
+                                        profileImage: true
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    orderBy: {
+                        createdAt: 'desc'
                     }
                 }
             }
@@ -754,10 +870,14 @@ clientRouter.get('/dashboard', authenticateToken, async (req, res) => {
             pendingApplications: client.projects.reduce((sum, project) => sum + project.applications.length, 0)
         };
 
-        const dashboardData = { client, stats };
+        const dashboardData = { 
+            client, 
+            stats,
+            recentProjects: client.projects.slice(0, 5) // Show 5 most recent projects
+        };
 
-        // Cache the dashboard data
-        await setCache(cacheKey, dashboardData, 300); // Cache for 5 minutes
+        // Cache for shorter duration (2 minutes instead of 5)
+        await setCache(cacheKey, dashboardData, 120);
 
         res.status(200).json({
             success: true,

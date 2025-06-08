@@ -940,3 +940,1174 @@ publicRouter.get('/users/:userId/ratings/summary', async (req, res) => {
         });
     }
 });
+
+// GET /api/public/freelancers/:freelancerId/profile - Get detailed freelancer public profile
+publicRouter.get('/freelancers/:freelancerId/profile', async (req, res) => {
+    try {
+        const { freelancerId } = req.params;
+        const cacheKey = `public:freelancer:profile:${freelancerId}`;
+
+        // Check cache first
+        const cachedProfile = await getCache(cacheKey);
+        if (cachedProfile) {
+            return res.status(200).json({
+                success: true,
+                data: cachedProfile,
+                cached: true
+            });
+        }
+
+        // Get freelancer with all related data
+        const freelancer = await prisma.freelancer.findUnique({
+            where: { 
+                id: freelancerId,
+                user: {
+                    isActive: true // Only show active freelancers
+                }
+            },
+            include: {
+                user: {
+                    select: {
+                        id: true,
+                        name: true,
+                        email: true, // Consider removing for privacy
+                        profileImage: true,
+                        bio: true,
+                        location: true,
+                        createdAt: true
+                    }
+                },
+                // Completed projects assigned to this freelancer
+                assignedProjects: {
+                    where: {
+                        status: 'COMPLETED'
+                    },
+                    select: {
+                        id: true,
+                        title: true,
+                        description: true,
+                        skillsRequired: true,
+                        budgetMin: true,
+                        budgetMax: true,
+                        duration: true,
+                        createdAt: true,
+                        updatedAt: true,
+                        client: {
+                            select: {
+                                companyName: true,
+                                industry: true,
+                                user: {
+                                    select: {
+                                        name: true,
+                                        profileImage: true,
+                                        location: true
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    orderBy: {
+                        updatedAt: 'desc'
+                    },
+                    take: 10 // Show latest 10 completed projects
+                }
+            }
+        });
+
+        if (!freelancer) {
+            return res.status(404).json({
+                success: false,
+                message: 'Freelancer not found or account is inactive'
+            });
+        }
+
+        // Get ratings received by this freelancer (from clients)
+        const [ratingsReceived, ratingStats, ratingDistribution] = await Promise.all([
+            // Latest 5 ratings received
+            prisma.rating.findMany({
+                where: {
+                    ratedId: freelancer.user.id,
+                    raterType: 'CLIENT_TO_FREELANCER'
+                },
+                select: {
+                    id: true,
+                    rating: true,
+                    review: true,
+                    createdAt: true,
+                    project: {
+                        select: {
+                            title: true
+                        }
+                    }
+                },
+                orderBy: {
+                    createdAt: 'desc'
+                },
+                take: 5
+            }),
+            
+            // Rating statistics
+            prisma.rating.aggregate({
+                where: {
+                    ratedId: freelancer.user.id,
+                    raterType: 'CLIENT_TO_FREELANCER'
+                },
+                _avg: {
+                    rating: true
+                },
+                _count: {
+                    rating: true
+                }
+            }),
+            
+            // Rating distribution
+            prisma.rating.groupBy({
+                by: ['rating'],
+                where: {
+                    ratedId: freelancer.user.id,
+                    raterType: 'CLIENT_TO_FREELANCER'
+                },
+                _count: {
+                    rating: true
+                }
+            })
+        ]);
+
+        // Create rating distribution object
+        const distribution = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+        ratingDistribution.forEach(item => {
+            distribution[item.rating] = item._count.rating;
+        });
+
+        // Calculate additional metrics
+        const totalProjectsValue = freelancer.assignedProjects.reduce((sum, project) => {
+            return sum + (project.budgetMax || project.budgetMin || 0);
+        }, 0);
+
+        const averageProjectDuration = freelancer.assignedProjects.length > 0 ? 
+            freelancer.assignedProjects.reduce((sum, project) => {
+                const startDate = new Date(project.createdAt);
+                const endDate = new Date(project.updatedAt);
+                const durationDays = Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24));
+                return sum + durationDays;
+            }, 0) / freelancer.assignedProjects.length : 0;
+
+        const profileData = {
+            freelancer: {
+                id: freelancer.id,
+                profile: {
+                    name: freelancer.user.name,
+                    profileImage: freelancer.user.profileImage,
+                    bio: freelancer.user.bio,
+                    location: freelancer.user.location,
+                    memberSince: freelancer.user.createdAt
+                },
+                professionalInfo: {
+                    skills: freelancer.skills,
+                    experience: freelancer.experience,
+                    hourlyRate: freelancer.hourlyRate,
+                    availability: freelancer.availability,
+                    isVerified: freelancer.isVerified
+                },
+                portfolioLinks: {
+                    github: freelancer.githubUrl,
+                    linkedin: freelancer.linkedinUrl,
+                    portfolio: freelancer.portfolioUrl
+                },
+                statistics: {
+                    projectsCompleted: freelancer.projectsCompleted,
+                    averageRating: ratingStats._avg.rating ? parseFloat(ratingStats._avg.rating.toFixed(2)) : 0,
+                    totalRatings: ratingStats._count.rating,
+                    totalProjectsValue,
+                    averageProjectDuration: Math.ceil(averageProjectDuration),
+                    ratingDistribution: distribution
+                }
+            },
+            ratingsReceived: ratingsReceived.map(rating => ({
+                id: rating.id,
+                rating: rating.rating,
+                review: rating.review,
+                projectTitle: rating.project.title,
+                createdAt: rating.createdAt
+            })),
+            completedProjects: freelancer.assignedProjects.map(project => ({
+                id: project.id,
+                title: project.title,
+                description: project.description.length > 200 ? 
+                    project.description.substring(0, 200) + '...' : 
+                    project.description,
+                skillsRequired: project.skillsRequired,
+                budget: {
+                    min: project.budgetMin,
+                    max: project.budgetMax
+                },
+                duration: project.duration,
+                completedAt: project.updatedAt,
+                client: {
+                    name: project.client.user.name,
+                    company: project.client.companyName,
+                    industry: project.client.industry,
+                    location: project.client.user.location,
+                    profileImage: project.client.user.profileImage
+                }
+            }))
+        };
+
+        // Cache for 30 minutes (profile data changes less frequently)
+        await setCache(cacheKey, profileData, 1800);
+
+        res.status(200).json({
+            success: true,
+            data: profileData
+        });
+
+    } catch (error) {
+        console.error('Get freelancer public profile error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// GET /api/public/clients/:clientId/profile - Get detailed client public profile
+publicRouter.get('/clients/:clientId/profile', async (req, res) => {
+    try {
+        const { clientId } = req.params;
+        const cacheKey = `public:client:profile:${clientId}`;
+
+        // Check cache first
+        const cachedProfile = await getCache(cacheKey);
+        if (cachedProfile) {
+            return res.status(200).json({
+                success: true,
+                data: cachedProfile,
+                cached: true
+            });
+        }
+
+        // Get client with all related data
+        const client = await prisma.client.findUnique({
+            where: { 
+                id: clientId,
+                user: {
+                    isActive: true // Only show active clients
+                }
+            },
+            include: {
+                user: {
+                    select: {
+                        id: true,
+                        name: true,
+                        profileImage: true,
+                        bio: true,
+                        location: true,
+                        createdAt: true
+                    }
+                },
+                // Projects posted by this client
+                projects: {
+                    where: {
+                        status: 'COMPLETED'
+                    },
+                    select: {
+                        id: true,
+                        title: true,
+                        description: true,
+                        skillsRequired: true,
+                        budgetMin: true,
+                        budgetMax: true,
+                        duration: true,
+                        createdAt: true,
+                        updatedAt: true,
+                        freelancer: {
+                            select: {
+                                user: {
+                                    select: {
+                                        name: true,
+                                        profileImage: true
+                                    }
+                                },
+                                skills: true,
+                                experience: true,
+                                ratings: true
+                            }
+                        }
+                    },
+                    orderBy: {
+                        updatedAt: 'desc'
+                    },
+                    take: 10 // Show latest 10 completed projects
+                }
+            }
+        });
+
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                message: 'Client not found or account is inactive'
+            });
+        }
+
+        // Get ratings received by this client (from freelancers)
+        const [ratingsReceived, ratingStats, ratingDistribution] = await Promise.all([
+            // Latest 5 ratings received
+            prisma.rating.findMany({
+                where: {
+                    ratedId: client.user.id,
+                    raterType: 'FREELANCER_TO_CLIENT'
+                },
+                select: {
+                    id: true,
+                    rating: true,
+                    review: true,
+                    createdAt: true,
+                    project: {
+                        select: {
+                            title: true
+                        }
+                    }
+                },
+                orderBy: {
+                    createdAt: 'desc'
+                },
+                take: 5
+            }),
+            
+            // Rating statistics
+            prisma.rating.aggregate({
+                where: {
+                    ratedId: client.user.id,
+                    raterType: 'FREELANCER_TO_CLIENT'
+                },
+                _avg: {
+                    rating: true
+                },
+                _count: {
+                    rating: true
+                }
+            }),
+            
+            // Rating distribution
+            prisma.rating.groupBy({
+                by: ['rating'],
+                where: {
+                    ratedId: client.user.id,
+                    raterType: 'FREELANCER_TO_CLIENT'
+                },
+                _count: {
+                    rating: true
+                }
+            })
+        ]);
+
+        // Create rating distribution object
+        const distribution = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+        ratingDistribution.forEach(item => {
+            distribution[item.rating] = item._count.rating;
+        });
+
+        // Calculate additional metrics
+        const totalProjectsValue = client.projects.reduce((sum, project) => {
+            return sum + (project.budgetMax || project.budgetMin || 0);
+        }, 0);
+
+        const averageProjectBudget = client.projects.length > 0 ? 
+            totalProjectsValue / client.projects.length : 0;
+
+        const mostUsedSkills = client.projects.reduce((skillMap, project) => {
+            project.skillsRequired.forEach(skill => {
+                skillMap[skill] = (skillMap[skill] || 0) + 1;
+            });
+            return skillMap;
+        }, {});
+
+        const topSkills = Object.entries(mostUsedSkills)
+            .sort(([,a], [,b]) => b - a)
+            .slice(0, 10)
+            .map(([skill, count]) => ({ skill, projectCount: count }));
+
+        const profileData = {
+            client: {
+                id: client.id,
+                profile: {
+                    name: client.user.name,
+                    profileImage: client.user.profileImage,
+                    bio: client.user.bio,
+                    location: client.user.location,
+                    memberSince: client.user.createdAt
+                },
+                companyInfo: {
+                    companyName: client.companyName,
+                    industry: client.industry,
+                    companySize: client.companySize,
+                    website: client.website,
+                    isVerified: client.isVerified
+                },
+                statistics: {
+                    projectsPosted: client.projectsPosted,
+                    projectsCompleted: client.projects.length,
+                    averageRating: ratingStats._avg.rating ? parseFloat(ratingStats._avg.rating.toFixed(2)) : 0,
+                    totalRatings: ratingStats._count.rating,
+                    totalProjectsValue,
+                    averageProjectBudget: Math.ceil(averageProjectBudget),
+                    ratingDistribution: distribution,
+                    topSkillsHired: topSkills
+                }
+            },
+            ratingsReceived: ratingsReceived.map(rating => ({
+                id: rating.id,
+                rating: rating.rating,
+                review: rating.review,
+                projectTitle: rating.project.title,
+                createdAt: rating.createdAt
+            })),
+            completedProjects: client.projects.map(project => ({
+                id: project.id,
+                title: project.title,
+                description: project.description.length > 200 ? 
+                    project.description.substring(0, 200) + '...' : 
+                    project.description,
+                skillsRequired: project.skillsRequired,
+                budget: {
+                    min: project.budgetMin,
+                    max: project.budgetMax
+                },
+                duration: project.duration,
+                completedAt: project.updatedAt,
+                freelancer: project.freelancer ? {
+                    name: project.freelancer.user.name,
+                    profileImage: project.freelancer.user.profileImage,
+                    skills: project.freelancer.skills.slice(0, 5), // Show top 5 skills
+                    experience: project.freelancer.experience,
+                    rating: project.freelancer.ratings
+                } : null
+            }))
+        };
+
+        // Cache for 30 minutes (profile data changes less frequently)
+        await setCache(cacheKey, profileData, 1800);
+
+        res.status(200).json({
+            success: true,
+            data: profileData
+        });
+
+    } catch (error) {
+        console.error('Get client public profile error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// GET /api/public/users/:userId/profile - Get user profile by userId (auto-detect freelancer or client)
+publicRouter.get('/users/:userId/profile', async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const cacheKey = `public:user:profile:${userId}`;
+
+        // Check cache first
+        const cachedProfile = await getCache(cacheKey);
+        if (cachedProfile) {
+            return res.status(200).json({
+                success: true,
+                data: cachedProfile,
+                cached: true
+            });
+        }
+
+        // First, determine if user is freelancer or client
+        const user = await prisma.user.findUnique({
+            where: { 
+                id: userId,
+                isActive: true
+            },
+            include: {
+                freelancer: true,
+                client: true
+            }
+        });
+
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                message: 'User not found or account is inactive'
+            });
+        }
+
+        let profileData;
+
+        if (user.role === 'FREELANCER' && user.freelancer) {
+            // Get freelancer profile data directly (don't use HTTP request)
+            const freelancer = await prisma.freelancer.findUnique({
+                where: { 
+                    id: user.freelancer.id,
+                    user: {
+                        isActive: true
+                    }
+                },
+                include: {
+                    user: {
+                        select: {
+                            id: true,
+                            name: true,
+                            profileImage: true,
+                            bio: true,
+                            location: true,
+                            createdAt: true
+                        }
+                    },
+                    assignedProjects: {
+                        where: {
+                            status: 'COMPLETED'
+                        },
+                        select: {
+                            id: true,
+                            title: true,
+                            description: true,
+                            skillsRequired: true,
+                            budgetMin: true,
+                            budgetMax: true,
+                            duration: true,
+                            createdAt: true,
+                            updatedAt: true,
+                            client: {
+                                select: {
+                                    companyName: true,
+                                    industry: true,
+                                    user: {
+                                        select: {
+                                            name: true,
+                                            profileImage: true,
+                                            location: true
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        orderBy: {
+                            updatedAt: 'desc'
+                        },
+                        take: 10
+                    }
+                }
+            });
+
+            if (!freelancer) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Freelancer profile not found'
+                });
+            }
+
+            // Get ratings data
+            const [ratingsReceived, ratingStats, ratingDistribution] = await Promise.all([
+                prisma.rating.findMany({
+                    where: {
+                        ratedId: freelancer.user.id,
+                        raterType: 'CLIENT_TO_FREELANCER'
+                    },
+                    select: {
+                        id: true,
+                        rating: true,
+                        review: true,
+                        createdAt: true,
+                        project: {
+                            select: {
+                                title: true
+                            }
+                        }
+                    },
+                    orderBy: {
+                        createdAt: 'desc'
+                    },
+                    take: 5
+                }),
+                
+                prisma.rating.aggregate({
+                    where: {
+                        ratedId: freelancer.user.id,
+                        raterType: 'CLIENT_TO_FREELANCER'
+                    },
+                    _avg: {
+                        rating: true
+                    },
+                    _count: {
+                        rating: true
+                    }
+                }),
+                
+                prisma.rating.groupBy({
+                    by: ['rating'],
+                    where: {
+                        ratedId: freelancer.user.id,
+                        raterType: 'CLIENT_TO_FREELANCER'
+                    },
+                    _count: {
+                        rating: true
+                    }
+                })
+            ]);
+
+            // Create rating distribution
+            const distribution = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+            ratingDistribution.forEach(item => {
+                distribution[item.rating] = item._count.rating;
+            });
+
+            // Calculate metrics
+            const totalProjectsValue = freelancer.assignedProjects.reduce((sum, project) => {
+                return sum + (project.budgetMax || project.budgetMin || 0);
+            }, 0);
+
+            const averageProjectDuration = freelancer.assignedProjects.length > 0 ? 
+                freelancer.assignedProjects.reduce((sum, project) => {
+                    const startDate = new Date(project.createdAt);
+                    const endDate = new Date(project.updatedAt);
+                    const durationDays = Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24));
+                    return sum + durationDays;
+                }, 0) / freelancer.assignedProjects.length : 0;
+
+            profileData = {
+                userType: 'FREELANCER',
+                freelancer: {
+                    id: freelancer.id,
+                    profile: {
+                        name: freelancer.user.name,
+                        profileImage: freelancer.user.profileImage,
+                        bio: freelancer.user.bio,
+                        location: freelancer.user.location,
+                        memberSince: freelancer.user.createdAt
+                    },
+                    professionalInfo: {
+                        skills: freelancer.skills,
+                        experience: freelancer.experience,
+                        hourlyRate: freelancer.hourlyRate,
+                        availability: freelancer.availability,
+                        isVerified: freelancer.isVerified
+                    },
+                    portfolioLinks: {
+                        github: freelancer.githubUrl,
+                        linkedin: freelancer.linkedinUrl,
+                        portfolio: freelancer.portfolioUrl
+                    },
+                    statistics: {
+                        projectsCompleted: freelancer.projectsCompleted,
+                        averageRating: ratingStats._avg.rating ? parseFloat(ratingStats._avg.rating.toFixed(2)) : 0,
+                        totalRatings: ratingStats._count.rating,
+                        totalProjectsValue,
+                        averageProjectDuration: Math.ceil(averageProjectDuration),
+                        ratingDistribution: distribution
+                    }
+                },
+                ratingsReceived: ratingsReceived.map(rating => ({
+                    id: rating.id,
+                    rating: rating.rating,
+                    review: rating.review,
+                    projectTitle: rating.project.title,
+                    createdAt: rating.createdAt
+                })),
+                completedProjects: freelancer.assignedProjects.map(project => ({
+                    id: project.id,
+                    title: project.title,
+                    description: project.description.length > 200 ? 
+                        project.description.substring(0, 200) + '...' : 
+                        project.description,
+                    skillsRequired: project.skillsRequired,
+                    budget: {
+                        min: project.budgetMin,
+                        max: project.budgetMax
+                    },
+                    duration: project.duration,
+                    completedAt: project.updatedAt,
+                    client: {
+                        name: project.client.user.name,
+                        company: project.client.companyName,
+                        industry: project.client.industry,
+                        location: project.client.user.location,
+                        profileImage: project.client.user.profileImage
+                    }
+                }))
+            };
+
+        } else if (user.role === 'CLIENT' && user.client) {
+            // Get client profile data directly (don't use HTTP request)
+            const client = await prisma.client.findUnique({
+                where: { 
+                    id: user.client.id,
+                    user: {
+                        isActive: true
+                    }
+                },
+                include: {
+                    user: {
+                        select: {
+                            id: true,
+                            name: true,
+                            profileImage: true,
+                            bio: true,
+                            location: true,
+                            createdAt: true
+                        }
+                    },
+                    projects: {
+                        where: {
+                            status: 'COMPLETED'
+                        },
+                        select: {
+                            id: true,
+                            title: true,
+                            description: true,
+                            skillsRequired: true,
+                            budgetMin: true,
+                            budgetMax: true,
+                            duration: true,
+                            createdAt: true,
+                            updatedAt: true,
+                            freelancer: {
+                                select: {
+                                    user: {
+                                        select: {
+                                            name: true,
+                                            profileImage: true
+                                        }
+                                    },
+                                    skills: true,
+                                    experience: true,
+                                    ratings: true
+                                }
+                            }
+                        },
+                        orderBy: {
+                            updatedAt: 'desc'
+                        },
+                        take: 10
+                    }
+                }
+            });
+
+            if (!client) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Client profile not found'
+                });
+            }
+
+            // Get ratings data for client
+            const [ratingsReceived, ratingStats, ratingDistribution] = await Promise.all([
+                prisma.rating.findMany({
+                    where: {
+                        ratedId: client.user.id,
+                        raterType: 'FREELANCER_TO_CLIENT'
+                    },
+                    select: {
+                        id: true,
+                        rating: true,
+                        review: true,
+                        createdAt: true,
+                        project: {
+                            select: {
+                                title: true
+                            }
+                        }
+                    },
+                    orderBy: {
+                        createdAt: 'desc'
+                    },
+                    take: 5
+                }),
+                
+                prisma.rating.aggregate({
+                    where: {
+                        ratedId: client.user.id,
+                        raterType: 'FREELANCER_TO_CLIENT'
+                    },
+                    _avg: {
+                        rating: true
+                    },
+                    _count: {
+                        rating: true
+                    }
+                }),
+                
+                prisma.rating.groupBy({
+                    by: ['rating'],
+                    where: {
+                        ratedId: client.user.id,
+                        raterType: 'FREELANCER_TO_CLIENT'
+                    },
+                    _count: {
+                        rating: true
+                    }
+                })
+            ]);
+
+            // Create rating distribution
+            const distribution = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+            ratingDistribution.forEach(item => {
+                distribution[item.rating] = item._count.rating;
+            });
+
+            // Calculate metrics
+            const totalProjectsValue = client.projects.reduce((sum, project) => {
+                return sum + (project.budgetMax || project.budgetMin || 0);
+            }, 0);
+
+            const averageProjectBudget = client.projects.length > 0 ? 
+                totalProjectsValue / client.projects.length : 0;
+
+            const mostUsedSkills = client.projects.reduce((skillMap, project) => {
+                project.skillsRequired.forEach(skill => {
+                    skillMap[skill] = (skillMap[skill] || 0) + 1;
+                });
+                return skillMap;
+            }, {});
+
+            const topSkills = Object.entries(mostUsedSkills)
+                .sort(([,a], [,b]) => b - a)
+                .slice(0, 10)
+                .map(([skill, count]) => ({ skill, projectCount: count }));
+
+            profileData = {
+                userType: 'CLIENT',
+                client: {
+                    id: client.id,
+                    profile: {
+                        name: client.user.name,
+                        profileImage: client.user.profileImage,
+                        bio: client.user.bio,
+                        location: client.user.location,
+                        memberSince: client.user.createdAt
+                    },
+                    companyInfo: {
+                        companyName: client.companyName,
+                        industry: client.industry,
+                        companySize: client.companySize,
+                        website: client.website,
+                        isVerified: client.isVerified
+                    },
+                    statistics: {
+                        projectsPosted: client.projectsPosted,
+                        projectsCompleted: client.projects.length,
+                        averageRating: ratingStats._avg.rating ? parseFloat(ratingStats._avg.rating.toFixed(2)) : 0,
+                        totalRatings: ratingStats._count.rating,
+                        totalProjectsValue,
+                        averageProjectBudget: Math.ceil(averageProjectBudget),
+                        ratingDistribution: distribution,
+                        topSkillsHired: topSkills
+                    }
+                },
+                ratingsReceived: ratingsReceived.map(rating => ({
+                    id: rating.id,
+                    rating: rating.rating,
+                    review: rating.review,
+                    projectTitle: rating.project.title,
+                    createdAt: rating.createdAt
+                })),
+                completedProjects: client.projects.map(project => ({
+                    id: project.id,
+                    title: project.title,
+                    description: project.description.length > 200 ? 
+                        project.description.substring(0, 200) + '...' : 
+                        project.description,
+                    skillsRequired: project.skillsRequired,
+                    budget: {
+                        min: project.budgetMin,
+                        max: project.budgetMax
+                    },
+                    duration: project.duration,
+                    completedAt: project.updatedAt,
+                    freelancer: project.freelancer ? {
+                        name: project.freelancer.user.name,
+                        profileImage: project.freelancer.user.profileImage,
+                        skills: project.freelancer.skills.slice(0, 5),
+                        experience: project.freelancer.experience,
+                        rating: project.freelancer.ratings
+                    } : null
+                }))
+            };
+
+        } else {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid user type or incomplete profile'
+            });
+        }
+
+        // Cache for 30 minutes
+        await setCache(cacheKey, profileData, 1800);
+
+        res.status(200).json({
+            success: true,
+            data: profileData
+        });
+
+    } catch (error) {
+        console.error('Get user profile error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// GET /api/public/profiles/search - Search across both freelancers and clients
+publicRouter.get('/profiles/search', async (req, res) => {
+    try {
+        const { 
+            query, 
+            type, // 'freelancer', 'client', or 'all'
+            skills,
+            location,
+            minRating,
+            page = 1, 
+            limit = 12 
+        } = req.query;
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+        const cacheKey = `public:profiles:search:${JSON.stringify(req.query)}`;
+
+        // Check cache
+        const cachedResults = await getCache(cacheKey);
+        if (cachedResults) {
+            return res.status(200).json({
+                success: true,
+                data: cachedResults,
+                cached: true
+            });
+        }
+
+        const results = {};
+
+        // Search freelancers
+        if (!type || type === 'all' || type === 'freelancer') {
+            const freelancerWhere = {
+                user: {
+                    isActive: true,
+                    ...(query && {
+                        OR: [
+                            { name: { contains: query, mode: 'insensitive' } },
+                            { bio: { contains: query, mode: 'insensitive' } }
+                        ]
+                    }),
+                    ...(location && {
+                        location: { contains: location, mode: 'insensitive' }
+                    })
+                },
+                ...(skills && {
+                    skills: {
+                        hasSome: skills.split(',').map(s => s.trim())
+                    }
+                }),
+                ...(minRating && {
+                    ratings: { gte: parseFloat(minRating) }
+                })
+            };
+
+            const freelancers = await prisma.freelancer.findMany({
+                where: freelancerWhere,
+                include: {
+                    user: {
+                        select: {
+                            id: true,
+                            name: true,
+                            profileImage: true,
+                            bio: true,
+                            location: true,
+                            createdAt: true
+                        }
+                    }
+                },
+                orderBy: [
+                    { ratings: 'desc' },
+                    { projectsCompleted: 'desc' }
+                ],
+                skip: type === 'freelancer' ? skip : 0,
+                take: type === 'freelancer' ? parseInt(limit) : 6
+            });
+
+            results.freelancers = freelancers.map(freelancer => ({
+                id: freelancer.id,
+                userId: freelancer.user.id,
+                type: 'FREELANCER',
+                profile: {
+                    name: freelancer.user.name,
+                    profileImage: freelancer.user.profileImage,
+                    bio: freelancer.user.bio,
+                    location: freelancer.user.location,
+                    memberSince: freelancer.user.createdAt
+                },
+                skills: freelancer.skills,
+                experience: freelancer.experience,
+                hourlyRate: freelancer.hourlyRate,
+                ratings: freelancer.ratings,
+                projectsCompleted: freelancer.projectsCompleted,
+                availability: freelancer.availability
+            }));
+        }
+
+        // Search clients
+        if (!type || type === 'all' || type === 'client') {
+            const clientWhere = {
+                user: {
+                    isActive: true,
+                    ...(query && {
+                        OR: [
+                            { name: { contains: query, mode: 'insensitive' } },
+                            { bio: { contains: query, mode: 'insensitive' } }
+                        ]
+                    }),
+                    ...(location && {
+                        location: { contains: location, mode: 'insensitive' }
+                    })
+                },
+                ...(query && {
+                    OR: [
+                        { companyName: { contains: query, mode: 'insensitive' } },
+                        { industry: { contains: query, mode: 'insensitive' } }
+                    ]
+                }),
+                ...(minRating && {
+                    ratings: { gte: parseFloat(minRating) }
+                })
+            };
+
+            const clients = await prisma.client.findMany({
+                where: clientWhere,
+                include: {
+                    user: {
+                        select: {
+                            id: true,
+                            name: true,
+                            profileImage: true,
+                            bio: true,
+                            location: true,
+                            createdAt: true
+                        }
+                    }
+                },
+                orderBy: [
+                    { ratings: 'desc' },
+                    { projectsPosted: 'desc' }
+                ],
+                skip: type === 'client' ? skip : 0,
+                take: type === 'client' ? parseInt(limit) : 6
+            });
+
+            results.clients = clients.map(client => ({
+                id: client.id,
+                userId: client.user.id,
+                type: 'CLIENT',
+                profile: {
+                    name: client.user.name,
+                    profileImage: client.user.profileImage,
+                    bio: client.user.bio,
+                    location: client.user.location,
+                    memberSince: client.user.createdAt
+                },
+                companyName: client.companyName,
+                industry: client.industry,
+                companySize: client.companySize,
+                ratings: client.ratings,
+                projectsPosted: client.projectsPosted,
+                website: client.website
+            }));
+        }
+
+        // Get total counts for pagination
+        const totalCounts = {};
+        if (type === 'freelancer' || !type || type === 'all') {
+            totalCounts.freelancers = await prisma.freelancer.count({
+                where: {
+                    user: {
+                        isActive: true,
+                        ...(query && {
+                            OR: [
+                                { name: { contains: query, mode: 'insensitive' } },
+                                { bio: { contains: query, mode: 'insensitive' } }
+                            ]
+                        }),
+                        ...(location && {
+                            location: { contains: location, mode: 'insensitive' }
+                        })
+                    },
+                    ...(skills && {
+                        skills: {
+                            hasSome: skills.split(',').map(s => s.trim())
+                        }
+                    }),
+                    ...(minRating && {
+                        ratings: { gte: parseFloat(minRating) }
+                    })
+                }
+            });
+        }
+
+        if (type === 'client' || !type || type === 'all') {
+            totalCounts.clients = await prisma.client.count({
+                where: {
+                    user: {
+                        isActive: true,
+                        ...(query && {
+                            OR: [
+                                { name: { contains: query, mode: 'insensitive' } },
+                                { bio: { contains: query, mode: 'insensitive' } }
+                            ]
+                        }),
+                        ...(location && {
+                            location: { contains: location, mode: 'insensitive' }
+                        })
+                    },
+                    ...(query && {
+                        OR: [
+                            { companyName: { contains: query, mode: 'insensitive' } },
+                            { industry: { contains: query, mode: 'insensitive' } }
+                        ]
+                    }),
+                    ...(minRating && {
+                        ratings: { gte: parseFloat(minRating) }
+                    })
+                }
+            });
+        }
+
+        const responseData = {
+            ...results,
+            totalCounts,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total: totalCounts.freelancers + totalCounts.clients || 0,
+                pages: Math.ceil((totalCounts.freelancers + totalCounts.clients || 0) / parseInt(limit))
+            },
+            searchQuery: {
+                query,
+                type,
+                skills: skills ? skills.split(',') : null,
+                location,
+                minRating
+            }
+        };
+
+        // Cache for 15 minutes
+        await setCache(cacheKey, responseData, 900);
+
+        res.status(200).json({
+            success: true,
+            data: responseData
+        });
+
+    } catch (error) {
+        console.error('Search profiles error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});

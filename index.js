@@ -1,7 +1,8 @@
+// IMPORT STATEMENTS
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-
+import compression from 'compression';
 
 import {PrismaClient} from './generated/prisma/client.js'; // 
 const prisma = new PrismaClient();
@@ -12,6 +13,7 @@ import { publicRouter } from './publicRoutes/publicroutes.js';
 import { adminRouter } from './admin/admin.js';
 
 const PORT = process.env.PORT || 3000;
+
 const app = express();
 
 
@@ -20,6 +22,7 @@ dotenv.config();
 
 
 app.use(cors());
+app.use(compression());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
