@@ -383,6 +383,19 @@ clientRouter.get('/projects/:projectId/applications', authenticateToken, async (
         const { projectId } = req.params;
         const { status, page = 1, limit = 10 } = req.query;
 
+        // Create cache key
+        const cacheKey = `client:project:${projectId}:applications:status:${status || 'all'}:page:${page}:limit:${limit}`;
+
+        // Check cache first (shorter duration for real-time updates)
+        const cachedApplications = await getCache(cacheKey);
+        if (cachedApplications) {
+            return res.status(200).json({
+                success: true,
+                data: cachedApplications,
+                cached: true
+            });
+        }
+
         const skip = (parseInt(page) - 1) * parseInt(limit);
 
         // Check if user is a client
@@ -420,54 +433,60 @@ clientRouter.get('/projects/:projectId/applications', authenticateToken, async (
             whereClause.status = status.toUpperCase();
         }
 
-        const applications = await prisma.application.findMany({
-            where: whereClause,
-            include: {
-                freelancer: {
-                    include: {
-                        user: {
-                            select: {
-                                name: true,
-                                email: true,
-                                profileImage: true,
-                                bio: true,
-                                location: true
+        const [applications, totalApplications] = await Promise.all([
+            prisma.application.findMany({
+                where: whereClause,
+                include: {
+                    freelancer: {
+                        include: {
+                            user: {
+                                select: {
+                                    name: true,
+                                    email: true,
+                                    profileImage: true,
+                                    bio: true,
+                                    location: true
+                                }
                             }
+                        }
+                    },
+                    project: {
+                        select: {
+                            title: true,
+                            description: true,
+                            skillsRequired: true,
+                            budgetMin: true,
+                            budgetMax: true
                         }
                     }
                 },
-                project: {
-                    select: {
-                        title: true,
-                        description: true,
-                        skillsRequired: true,
-                        budgetMin: true,
-                        budgetMax: true
-                    }
-                }
-            },
-            orderBy: {
-                createdAt: 'desc'
-            },
-            skip,
-            take: parseInt(limit)
-        });
+                orderBy: {
+                    createdAt: 'desc'
+                },
+                skip,
+                take: parseInt(limit)
+            }),
+            prisma.application.count({
+                where: whereClause
+            })
+        ]);
 
-        const totalApplications = await prisma.application.count({
-            where: whereClause
-        });
+        const responseData = {
+            applications,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total: totalApplications,
+                pages: Math.ceil(totalApplications / parseInt(limit))
+            }
+        };
+
+        // Cache for 2 minutes (short duration for real-time updates)
+        await setCache(cacheKey, responseData, 120);
 
         res.status(200).json({
             success: true,
-            data: {
-                applications,
-                pagination: {
-                    page: parseInt(page),
-                    limit: parseInt(limit),
-                    total: totalApplications,
-                    pages: Math.ceil(totalApplications / parseInt(limit))
-                }
-            }
+            data: responseData
         });
 
     } catch (error) {
@@ -533,7 +552,8 @@ clientRouter.put('/projects/:projectId/applications/:applicationId/approve', aut
                             select: {
                                 name: true,
                                 email: true,
-                                profileImage: true
+                                profileImage: true,
+                                id: true
                             }
                         }
                     }
@@ -598,6 +618,78 @@ clientRouter.put('/projects/:projectId/applications/:applicationId/approve', aut
             return { approvedApplication, updatedProject };
         });
 
+        // COMPREHENSIVE CACHE INVALIDATION FOR APPLICATION APPROVAL
+        const freelancerUserId = application.freelancer.user.id;
+        const cacheKeysToDelete = [
+            // Client caches
+            `client:dashboard:${userId}`,
+            
+            // Freelancer caches (application approved, project assigned)
+            `freelancer:dashboard:${freelancerUserId}`,
+            
+            // Public caches
+            'public:projects:available',
+            'admin:dashboard:stats'
+        ];
+
+        // Add paginated caches for both client and freelancer
+        for (let page = 1; page <= 10; page++) {
+            for (let limit of [10, 20, 50]) {
+                // Client caches
+                cacheKeysToDelete.push(
+                    `client:projects:${userId}:status:all:page:${page}:limit:${limit}`,
+                    `client:projects:${userId}:status:OPEN:page:${page}:limit:${limit}`,
+                    `client:projects:${userId}:status:ASSIGNED:page:${page}:limit:${limit}`,
+                    
+                    // Client application caches (this specific project)
+                    `client:applications:${userId}:status:all:page:${page}:limit:${limit}`,
+                    `client:applications:${userId}:status:PENDING:page:${page}:limit:${limit}`,
+                    `client:applications:${userId}:status:APPROVED:page:${page}:limit:${limit}`,
+                    `client:applications:${userId}:status:REJECTED:page:${page}:limit:${limit}`
+                );
+                
+                // Freelancer caches
+                cacheKeysToDelete.push(
+                    `freelancer:applications:${freelancerUserId}:status:all:page:${page}:limit:${limit}`,
+                    `freelancer:applications:${freelancerUserId}:status:PENDING:page:${page}:limit:${limit}`,
+                    `freelancer:applications:${freelancerUserId}:status:APPROVED:page:${page}:limit:${limit}`,
+                    `freelancer:applications:${freelancerUserId}:status:REJECTED:page:${page}:limit:${limit}`,
+                    `freelancer:projects:${freelancerUserId}:status:all:page:${page}:limit:${limit}`,
+                    `freelancer:projects:${freelancerUserId}:status:ASSIGNED:page:${page}:limit:${limit}`,
+                    
+                    // Available projects cache (project no longer available)
+                    `freelancer:available:projects:${freelancerUserId}:skills:default:budgetMin:any:budgetMax:any:page:${page}:limit:${limit}`
+                );
+            }
+        }
+
+        // Also clear project-specific application caches
+        for (let page = 1; page <= 10; page++) {
+            for (let limit of [10, 20, 50]) {
+                cacheKeysToDelete.push(
+                    `client:project:${projectId}:applications:status:all:page:${page}:limit:${limit}`,
+                    `client:project:${projectId}:applications:status:PENDING:page:${page}:limit:${limit}`,
+                    `client:project:${projectId}:applications:status:APPROVED:page:${page}:limit:${limit}`,
+                    `client:project:${projectId}:applications:status:REJECTED:page:${page}:limit:${limit}`
+                );
+            }
+        }
+
+        // Clear all skill-based available project caches for freelancer
+        if (application.freelancer.skills && application.freelancer.skills.length > 0) {
+            const skillsString = application.freelancer.skills.join(',');
+            for (let page = 1; page <= 5; page++) {
+                for (let limit of [10, 20, 50]) {
+                    cacheKeysToDelete.push(
+                        `freelancer:available:projects:${freelancerUserId}:skills:${skillsString}:budgetMin:any:budgetMax:any:page:${page}:limit:${limit}`
+                    );
+                }
+            }
+        }
+
+        // Execute cache deletion
+        await Promise.all(cacheKeysToDelete.map(key => deleteCache(key)));
+
         res.status(200).json({
             success: true,
             message: 'Application approved and project assigned successfully',
@@ -652,6 +744,20 @@ clientRouter.put('/projects/:projectId/applications/:applicationId/reject', auth
             where: {
                 id: applicationId,
                 projectId
+            },
+            include: {
+                freelancer: {
+                    include: {
+                        user: {
+                            select: {
+                                id: true,
+                                name: true,
+                                email: true,
+                                profileImage: true
+                            }
+                        }
+                    }
+                }
             }
         });
 
@@ -688,6 +794,46 @@ clientRouter.put('/projects/:projectId/applications/:applicationId/reject', auth
             }
         });
 
+        // COMPREHENSIVE CACHE INVALIDATION FOR APPLICATION REJECTION
+        const freelancerUserId = application.freelancer.user.id;
+        const cacheKeysToDelete = [
+            // Client caches
+            `client:dashboard:${userId}`,
+            
+            // Freelancer caches (application rejected)
+            `freelancer:dashboard:${freelancerUserId}`,
+            
+            // Admin dashboard
+            'admin:dashboard:stats'
+        ];
+
+        // Add paginated caches for both client and freelancer
+        for (let page = 1; page <= 10; page++) {
+            for (let limit of [10, 20, 50]) {
+                // Client caches
+                cacheKeysToDelete.push(
+                    `client:applications:${userId}:status:all:page:${page}:limit:${limit}`,
+                    `client:applications:${userId}:status:PENDING:page:${page}:limit:${limit}`,
+                    `client:applications:${userId}:status:REJECTED:page:${page}:limit:${limit}`,
+                    
+                    // Project-specific application caches
+                    `client:project:${projectId}:applications:status:all:page:${page}:limit:${limit}`,
+                    `client:project:${projectId}:applications:status:PENDING:page:${page}:limit:${limit}`,
+                    `client:project:${projectId}:applications:status:REJECTED:page:${page}:limit:${limit}`
+                );
+                
+                // Freelancer caches
+                cacheKeysToDelete.push(
+                    `freelancer:applications:${freelancerUserId}:status:all:page:${page}:limit:${limit}`,
+                    `freelancer:applications:${freelancerUserId}:status:PENDING:page:${page}:limit:${limit}`,
+                    `freelancer:applications:${freelancerUserId}:status:REJECTED:page:${page}:limit:${limit}`
+                );
+            }
+        }
+
+        // Execute cache deletion
+        await Promise.all(cacheKeysToDelete.map(key => deleteCache(key)));
+
         res.status(200).json({
             success: true,
             message: 'Application rejected successfully',
@@ -709,6 +855,19 @@ clientRouter.get('/applications', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.userId;
         const { status, page = 1, limit = 10 } = req.query;
+
+        // ADD THIS MISSING LINE
+        const cacheKey = `client:applications:${userId}:status:${status || 'all'}:page:${page}:limit:${limit}`;
+
+        // Check cache first (shorter duration for real-time updates)
+        const cachedApplications = await getCache(cacheKey);
+        if (cachedApplications) {
+            return res.status(200).json({
+                success: true,
+                data: cachedApplications,
+                cached: true
+            });
+        }
 
         const skip = (parseInt(page) - 1) * parseInt(limit);
 
@@ -786,18 +945,23 @@ clientRouter.get('/applications', authenticateToken, async (req, res) => {
             return acc;
         }, {});
 
+        const responseData = {
+            applications,
+            groupedApplications: Object.values(groupedApplications),
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total: totalApplications,
+                pages: Math.ceil(totalApplications / parseInt(limit))
+            }
+        };
+
+        // Cache for 2 minutes (short duration for real-time updates)
+        await setCache(cacheKey, responseData, 120);
+
         res.status(200).json({
             success: true,
-            data: {
-                applications,
-                groupedApplications: Object.values(groupedApplications),
-                pagination: {
-                    page: parseInt(page),
-                    limit: parseInt(limit),
-                    total: totalApplications,
-                    pages: Math.ceil(totalApplications / parseInt(limit))
-                }
-            }
+            data: responseData
         });
 
     } catch (error) {
@@ -920,7 +1084,16 @@ clientRouter.put('/projects/:projectId/approve-completion', authenticateToken, a
                 status: 'PENDING_COMPLETION'
             },
             include: {
-                freelancer: true
+                freelancer: {
+                    include: {
+                        user: {
+                            select: {
+                                id: true,
+                                name: true
+                            }
+                        }
+                    }
+                }
             }
         });
 
@@ -934,7 +1107,7 @@ clientRouter.put('/projects/:projectId/approve-completion', authenticateToken, a
         // Update project status to COMPLETED and increment freelancer's completed projects
         const updatedProject = await prisma.$transaction(async (tx) => {
             // Update project status
-            const project = await tx.project.update({
+            const completedProject = await tx.project.update({
                 where: { id: projectId },
                 data: { 
                     status: 'COMPLETED',
@@ -952,12 +1125,48 @@ clientRouter.put('/projects/:projectId/approve-completion', authenticateToken, a
                 }
             });
 
-            return project;
+            return completedProject;
         });
 
-        // Invalidate cache
-        await deleteCache(`client:projects:${userId}`);
-        await deleteCache(`freelancer:projects:${project.freelancer.userId}`);
+        // COMPREHENSIVE CACHE INVALIDATION FOR PROJECT COMPLETION
+        const freelancerUserId = project.freelancer.user.id;
+        const cacheKeysToDelete = [
+            // Client caches
+            `client:dashboard:${userId}`,
+            `client:profile:${userId}`,
+            
+            // Freelancer caches (project completed, stats updated)
+            `freelancer:dashboard:${freelancerUserId}`,
+            `freelancer:profile:${freelancerUserId}`,
+            
+            // Public caches (freelancer stats might affect featured list)
+            'public:featured:freelancers',
+            'admin:dashboard:stats'
+        ];
+
+        // Add paginated caches for both client and freelancer
+        for (let page = 1; page <= 10; page++) {
+            for (let limit of [10, 20, 50]) {
+                // Client project caches
+                cacheKeysToDelete.push(
+                    `client:projects:${userId}:status:all:page:${page}:limit:${limit}`,
+                    `client:projects:${userId}:status:PENDING_COMPLETION:page:${page}:limit:${limit}`,
+                    `client:projects:${userId}:status:COMPLETED:page:${page}:limit:${limit}`,
+                    `client:projects:${userId}:status:ASSIGNED:page:${page}:limit:${limit}`
+                );
+                
+                // Freelancer project caches
+                cacheKeysToDelete.push(
+                    `freelancer:projects:${freelancerUserId}:status:all:page:${page}:limit:${limit}`,
+                    `freelancer:projects:${freelancerUserId}:status:PENDING_COMPLETION:page:${page}:limit:${limit}`,
+                    `freelancer:projects:${freelancerUserId}:status:COMPLETED:page:${page}:limit:${limit}`,
+                    `freelancer:projects:${freelancerUserId}:status:ASSIGNED:page:${page}:limit:${limit}`
+                );
+            }
+        }
+
+        // Execute cache deletion
+        await Promise.all(cacheKeysToDelete.map(key => deleteCache(key)));
 
         res.status(200).json({
             success: true,
@@ -1017,17 +1226,49 @@ clientRouter.put('/projects/:projectId/reject-completion', authenticateToken, as
             });
         }
 
-        // Update project status back to ASSIGNED (so freelancer can continue working)
+        // Update project status back to ASSIGNED
         const updatedProject = await prisma.project.update({
             where: { id: projectId },
             data: { 
-                status: 'ASSIGNED', // Back to assigned so freelancer can continue
+                status: 'ASSIGNED',
                 updatedAt: new Date()
             }
         });
 
-        // Invalidate cache
-        await deleteCache(`client:projects:${userId}`);
+        // COMPREHENSIVE CACHE INVALIDATION FOR COMPLETION REJECTION
+        const freelancerUserId = project.freelancer.user.id;
+        const cacheKeysToDelete = [
+            // Client caches
+            `client:dashboard:${userId}`,
+            
+            // Freelancer caches (project status reverted)
+            `freelancer:dashboard:${freelancerUserId}`,
+            
+            // Admin dashboard
+            'admin:dashboard:stats'
+        ];
+
+        // Add paginated caches for both client and freelancer
+        for (let page = 1; page <= 10; page++) {
+            for (let limit of [10, 20, 50]) {
+                // Client project caches
+                cacheKeysToDelete.push(
+                    `client:projects:${userId}:status:all:page:${page}:limit:${limit}`,
+                    `client:projects:${userId}:status:PENDING_COMPLETION:page:${page}:limit:${limit}`,
+                    `client:projects:${userId}:status:ASSIGNED:page:${page}:limit:${limit}`
+                );
+                
+                // Freelancer project caches
+                cacheKeysToDelete.push(
+                    `freelancer:projects:${freelancerUserId}:status:all:page:${page}:limit:${limit}`,
+                    `freelancer:projects:${freelancerUserId}:status:PENDING_COMPLETION:page:${page}:limit:${limit}`,
+                    `freelancer:projects:${freelancerUserId}:status:ASSIGNED:page:${page}:limit:${limit}`
+                );
+            }
+        }
+
+        // Execute cache deletion
+        await Promise.all(cacheKeysToDelete.map(key => deleteCache(key)));
 
         res.status(200).json({
             success: true,
