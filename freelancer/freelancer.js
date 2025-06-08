@@ -239,6 +239,22 @@ flRouter.get('/projects/available', authenticateToken, checkFreelancerActive, as
         const userId = req.user.userId;
         const { skills, budgetMin, budgetMax, page = 1, limit = 10 } = req.query;
 
+        // Create specific cache key based on query parameters
+        const skillsParam = skills || 'default';
+        const budgetMinParam = budgetMin || 'any';
+        const budgetMaxParam = budgetMax || 'any';
+        const cacheKey = `freelancer:available:projects:${userId}:skills:${skillsParam}:budgetMin:${budgetMinParam}:budgetMax:${budgetMaxParam}:page:${page}:limit:${limit}`;
+
+        // Check cache first (shorter duration for real-time updates)
+        const cachedProjects = await getCache(cacheKey);
+        if (cachedProjects) {
+            return res.status(200).json({
+                success: true,
+                data: cachedProjects,
+                cached: true
+            });
+        }
+
         const skip = (parseInt(page) - 1) * parseInt(limit);
 
         // Use freelancer from middleware
@@ -246,11 +262,16 @@ flRouter.get('/projects/available', authenticateToken, checkFreelancerActive, as
 
         const whereClause = {
             status: 'OPEN',
-            assignedTo: null
+            assignedTo: null,
+            client: {
+                user: {
+                    isActive: true // Only show projects from active clients
+                }
+            }
         };
 
         // Filter by skills if provided, otherwise use freelancer's skills
-        const skillsToFilter = skills ? skills.split(',') : freelancer.skills;
+        const skillsToFilter = skills ? skills.split(',').map(s => s.trim()) : freelancer.skills;
         if (skillsToFilter.length > 0) {
             whereClause.skillsRequired = {
                 hasSome: skillsToFilter
@@ -265,53 +286,77 @@ flRouter.get('/projects/available', authenticateToken, checkFreelancerActive, as
             whereClause.budgetMax = { lte: parseFloat(budgetMax) };
         }
 
-        const projects = await prisma.project.findMany({
-            where: whereClause,
-            include: {
-                client: {
-                    include: {
-                        user: {
-                            select: {
-                                name: true,
-                                profileImage: true,
-                                location: true
+        const [projects, totalProjects] = await Promise.all([
+            prisma.project.findMany({
+                where: whereClause,
+                include: {
+                    client: {
+                        include: {
+                            user: {
+                                select: {
+                                    name: true,
+                                    profileImage: true,
+                                    location: true
+                                }
                             }
+                        }
+                    },
+                    applications: {
+                        where: {
+                            freelancerId: freelancer.id
+                        },
+                        select: {
+                            id: true,
+                            status: true,
+                            createdAt: true
+                        }
+                    },
+                    _count: {
+                        select: {
+                            applications: true
                         }
                     }
                 },
-                applications: {
-                    where: {
-                        freelancerId: freelancer.id
-                    },
-                    select: {
-                        id: true,
-                        status: true,
-                        createdAt: true
-                    }
-                }
-            },
-            orderBy: {
-                createdAt: 'desc'
-            },
-            skip,
-            take: parseInt(limit)
-        });
+                orderBy: {
+                    createdAt: 'desc'
+                },
+                skip,
+                take: parseInt(limit)
+            }),
+            prisma.project.count({
+                where: whereClause
+            })
+        ]);
 
-        const totalProjects = await prisma.project.count({
-            where: whereClause
-        });
+        // Format projects with additional metadata
+        const formattedProjects = projects.map(project => ({
+            ...project,
+            myApplication: project.applications.length > 0 ? project.applications[0] : null,
+            totalApplications: project._count.applications,
+            isMatch: skillsToFilter.some(skill => project.skillsRequired.includes(skill))
+        }));
+
+        const responseData = {
+            projects: formattedProjects,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total: totalProjects,
+                pages: Math.ceil(totalProjects / parseInt(limit))
+            },
+            filters: {
+                skills: skillsToFilter,
+                budgetMin: budgetMin ? parseFloat(budgetMin) : null,
+                budgetMax: budgetMax ? parseFloat(budgetMax) : null
+            }
+        };
+
+        // Cache for 3 minutes (projects change frequently)
+        await setCache(cacheKey, responseData, 180);
 
         res.status(200).json({
             success: true,
-            data: {
-                projects,
-                pagination: {
-                    page: parseInt(page),
-                    limit: parseInt(limit),
-                    total: totalProjects,
-                    pages: Math.ceil(totalProjects / parseInt(limit))
-                }
-            }
+            data: responseData
         });
 
     } catch (error) {
@@ -324,7 +369,93 @@ flRouter.get('/projects/available', authenticateToken, checkFreelancerActive, as
     }
 });
 
-// POST /api/freelancer/projects/:projectId/apply - Apply for a project
+// UPDATE: GET /api/freelancer/projects - Get freelancer's projects with caching
+flRouter.get('/projects', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { status, page = 1, limit = 10 } = req.query;
+
+        // Create cache key based on query parameters
+        const cacheKey = `freelancer:projects:${userId}:status:${status || 'all'}:page:${page}:limit:${limit}`;
+
+        // Check cache first (shorter duration)
+        const cachedProjects = await getCache(cacheKey);
+        if (cachedProjects) {
+            return res.status(200).json({
+                success: true,
+                data: cachedProjects,
+                cached: true
+            });
+        }
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        const whereClause = {
+            freelancer: {
+                userId
+            }
+        };
+
+        if (status) {
+            whereClause.status = status.toUpperCase();
+        }
+
+        const [projects, totalProjects] = await Promise.all([
+            prisma.project.findMany({
+                where: whereClause,
+                include: {
+                    client: {
+                        include: {
+                            user: {
+                                select: {
+                                    name: true,
+                                    email: true,
+                                    profileImage: true
+                                }
+                            }
+                        }
+                    }
+                },
+                orderBy: {
+                    createdAt: 'desc'
+                },
+                skip,
+                take: parseInt(limit)
+            }),
+            prisma.project.count({
+                where: whereClause
+            })
+        ]);
+
+        const responseData = {
+            projects,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total: totalProjects,
+                pages: Math.ceil(totalProjects / parseInt(limit))
+            }
+        };
+
+        // Cache for shorter duration (3 minutes)
+        await setCache(cacheKey, responseData, 180);
+
+        res.status(200).json({
+            success: true,
+            data: responseData
+        });
+
+    } catch (error) {
+        console.error('Get projects error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// UPDATE: POST /api/freelancer/projects/:projectId/apply - Apply for a project with cache invalidation
 flRouter.post('/projects/:projectId/apply', authenticateToken, checkFreelancerActive, async (req, res) => {
     try {
         const userId = req.user.userId;
@@ -441,6 +572,63 @@ flRouter.post('/projects/:projectId/apply', authenticateToken, checkFreelancerAc
             }
         });
 
+        // COMPREHENSIVE CACHE INVALIDATION FOR APPLICATION CREATION
+        const cacheKeysToDelete = [
+            // Freelancer caches
+            `freelancer:dashboard:${userId}`,
+            
+            // Client caches (project now has new application)
+            `client:dashboard:${project.client.userId}`,
+            `client:projects:${project.client.userId}`,
+            
+            // Project-specific caches
+            `project:${projectId}:applications`,
+            
+            // Public caches
+            'public:projects:available',
+            'admin:dashboard:stats'
+        ];
+
+        // Add paginated caches for both freelancer and client
+        for (let page = 1; page <= 10; page++) {
+            for (let limit of [10, 20, 50]) {
+                // Freelancer application caches
+                cacheKeysToDelete.push(
+                    `freelancer:applications:${userId}:status:all:page:${page}:limit:${limit}`,
+                    `freelancer:applications:${userId}:status:PENDING:page:${page}:limit:${limit}`,
+                    `freelancer:applications:${userId}:status:APPROVED:page:${page}:limit:${limit}`,
+                    `freelancer:applications:${userId}:status:REJECTED:page:${page}:limit:${limit}`
+                );
+                
+                // Available projects caches (this project might now show as applied)
+                cacheKeysToDelete.push(
+                    `freelancer:available:projects:${userId}:skills:default:budgetMin:any:budgetMax:any:page:${page}:limit:${limit}`
+                );
+                
+                // Client project and application caches
+                cacheKeysToDelete.push(
+                    `client:projects:${project.client.userId}:status:all:page:${page}:limit:${limit}`,
+                    `client:projects:${project.client.userId}:status:OPEN:page:${page}:limit:${limit}`,
+                    `client:applications:${project.client.userId}:status:all:page:${page}:limit:${limit}`,
+                    `client:applications:${project.client.userId}:status:PENDING:page:${page}:limit:${limit}`
+                );
+            }
+        }
+
+        // Also clear skill-based available project caches
+        if (freelancer.skills && freelancer.skills.length > 0) {
+            const skillsString = freelancer.skills.join(',');
+            for (let page = 1; page <= 5; page++) {
+                for (let limit of [10, 20, 50]) {
+                    cacheKeysToDelete.push(
+                        `freelancer:available:projects:${userId}:skills:${skillsString}:budgetMin:any:budgetMax:any:page:${page}:limit:${limit}`
+                    );
+                }
+            }
+        }
+
+        await Promise.all(cacheKeysToDelete.map(key => deleteCache(key)));
+
         res.status(201).json({
             success: true,
             message: 'Application submitted successfully',
@@ -457,11 +645,24 @@ flRouter.post('/projects/:projectId/apply', authenticateToken, checkFreelancerAc
     }
 });
 
-// GET /api/freelancer/applications - Get all applications
+// UPDATE: GET /api/freelancer/applications - Get all applications with caching
 flRouter.get('/applications', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.userId;
         const { status, page = 1, limit = 10 } = req.query;
+
+        // Create cache key based on query parameters
+        const cacheKey = `freelancer:applications:${userId}:status:${status || 'all'}:page:${page}:limit:${limit}`;
+
+        // Check cache first (shorter duration for real-time updates)
+        const cachedApplications = await getCache(cacheKey);
+        if (cachedApplications) {
+            return res.status(200).json({
+                success: true,
+                data: cachedApplications,
+                cached: true
+            });
+        }
 
         const skip = (parseInt(page) - 1) * parseInt(limit);
 
@@ -485,47 +686,53 @@ flRouter.get('/applications', authenticateToken, async (req, res) => {
             whereClause.status = status.toUpperCase();
         }
 
-        const applications = await prisma.application.findMany({
-            where: whereClause,
-            include: {
-                project: {
-                    include: {
-                        client: {
-                            include: {
-                                user: {
-                                    select: {
-                                        name: true,
-                                        email: true,
-                                        profileImage: true
+        const [applications, totalApplications] = await Promise.all([
+            prisma.application.findMany({
+                where: whereClause,
+                include: {
+                    project: {
+                        include: {
+                            client: {
+                                include: {
+                                    user: {
+                                        select: {
+                                            name: true,
+                                            email: true,
+                                            profileImage: true
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
-            },
-            orderBy: {
-                createdAt: 'desc'
-            },
-            skip,
-            take: parseInt(limit)
-        });
+                },
+                orderBy: {
+                    createdAt: 'desc'
+                },
+                skip,
+                take: parseInt(limit)
+            }),
+            prisma.application.count({
+                where: whereClause
+            })
+        ]);
 
-        const totalApplications = await prisma.application.count({
-            where: whereClause
-        });
+        const responseData = {
+            applications,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total: totalApplications,
+                pages: Math.ceil(totalApplications / parseInt(limit))
+            }
+        };
+
+        // Cache for shorter duration (2 minutes for real-time feel)
+        await setCache(cacheKey, responseData, 120);
 
         res.status(200).json({
             success: true,
-            data: {
-                applications,
-                pagination: {
-                    page: parseInt(page),
-                    limit: parseInt(limit),
-                    total: totalApplications,
-                    pages: Math.ceil(totalApplications / parseInt(limit))
-                }
-            }
+            data: responseData
         });
 
     } catch (error) {
@@ -538,7 +745,87 @@ flRouter.get('/applications', authenticateToken, async (req, res) => {
     }
 });
 
-// PUT /api/freelancer/projects/:projectId/request-completion - Request project completion
+// UPDATE: GET /api/freelancer/dashboard - Get dashboard data with shorter cache
+flRouter.get('/dashboard', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const cacheKey = `freelancer:dashboard:${userId}`;
+
+        // Check cache with shorter duration
+        const cachedDashboard = await getCache(cacheKey);
+        if (cachedDashboard) {
+            return res.status(200).json({
+                success: true,
+                data: cachedDashboard,
+                cached: true
+            });
+        }
+
+        // Fetch dashboard data from database
+        const freelancer = await prisma.freelancer.findUnique({
+            where: { userId },
+            include: {
+                assignedProjects: {
+                    orderBy: {
+                        createdAt: 'desc'
+                    },
+                    take: 5 // Show 5 most recent projects
+                },
+                applications: {
+                    orderBy: {
+                        createdAt: 'desc'
+                    },
+                    take: 5 // Show 5 most recent applications
+                },
+                user: {
+                    select: {
+                        isActive: true
+                    }
+                }
+            }
+        });
+
+        if (!freelancer) {
+            return res.status(404).json({
+                success: false,
+                message: 'Freelancer not found'
+            });
+        }
+
+        const stats = {
+            totalProjects: freelancer.projectsCompleted,
+            activeProjects: freelancer.assignedProjects.filter(p => p.status === 'ASSIGNED').length,
+            completedProjects: freelancer.assignedProjects.filter(p => p.status === 'COMPLETED').length,
+            pendingApplications: freelancer.applications.filter(app => app.status === 'PENDING').length,
+            approvedApplications: freelancer.applications.filter(app => app.status === 'APPROVED').length,
+            accountStatus: freelancer.user.isActive ? 'active' : 'suspended'
+        };
+
+        const dashboardData = { 
+            freelancer, 
+            stats,
+            recentProjects: freelancer.assignedProjects,
+            recentApplications: freelancer.applications
+        };
+
+        // Cache for shorter duration (2 minutes instead of 5)
+        await setCache(cacheKey, dashboardData, 120);
+
+        res.status(200).json({
+            success: true,
+            data: dashboardData
+        });
+    } catch (error) {
+        console.error('Dashboard error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// UPDATE: PUT /api/freelancer/projects/:projectId/request-completion - Request project completion with cache invalidation
 flRouter.put('/projects/:projectId/request-completion', authenticateToken, checkFreelancerActive, async (req, res) => {
     try {
         const userId = req.user.userId;
@@ -595,9 +882,38 @@ flRouter.put('/projects/:projectId/request-completion', authenticateToken, check
             }
         });
 
-        // Invalidate cache
-        await deleteCache(`freelancer:projects:${userId}`);
-        await deleteCache(`client:projects:${project.client.userId}`);
+        // COMPREHENSIVE CACHE INVALIDATION FOR COMPLETION REQUEST
+        const cacheKeysToDelete = [
+            // Freelancer caches
+            `freelancer:dashboard:${userId}`,
+            
+            // Client caches (project status changed)
+            `client:dashboard:${project.client.userId}`,
+            
+            // Public caches
+            'admin:dashboard:stats'
+        ];
+
+        // Add paginated caches for both users
+        for (let page = 1; page <= 10; page++) {
+            for (let limit of [10, 20, 50]) {
+                // Freelancer project caches
+                cacheKeysToDelete.push(
+                    `freelancer:projects:${userId}:status:all:page:${page}:limit:${limit}`,
+                    `freelancer:projects:${userId}:status:ASSIGNED:page:${page}:limit:${limit}`,
+                    `freelancer:projects:${userId}:status:PENDING_COMPLETION:page:${page}:limit:${limit}`
+                );
+                
+                // Client project caches
+                cacheKeysToDelete.push(
+                    `client:projects:${project.client.userId}:status:all:page:${page}:limit:${limit}`,
+                    `client:projects:${project.client.userId}:status:ASSIGNED:page:${page}:limit:${limit}`,
+                    `client:projects:${project.client.userId}:status:PENDING_COMPLETION:page:${page}:limit:${limit}`
+                );
+            }
+        }
+
+        await Promise.all(cacheKeysToDelete.map(key => deleteCache(key)));
 
         res.status(200).json({
             success: true,
@@ -1177,6 +1493,42 @@ flRouter.use((error, req, res, next) => {
 
     next(error);
 });
+
+// Add this helper function at the top of freelancer.js after imports
+
+const invalidateFreelancerCaches = async (userId, freelancerId = null) => {
+    const cacheKeysToDelete = [
+        // Freelancer specific caches
+        `freelancer:profile:${userId}`,
+        `freelancer:dashboard:${userId}`,
+        
+        // Public caches
+        'public:projects:available',
+        'public:projects:recent',
+        'public:featured:freelancers',
+        'admin:dashboard:stats'
+    ];
+
+    // Add application-related caches with different filters
+    const statuses = ['all', 'PENDING', 'APPROVED', 'REJECTED'];
+    const pages = Array.from({length: 5}, (_, i) => i + 1);
+    const limits = [10, 20, 50];
+
+    for (const status of statuses) {
+        for (const page of pages) {
+            for (const limit of limits) {
+                cacheKeysToDelete.push(
+                    `freelancer:applications:${userId}:status:${status}:page:${page}:limit:${limit}`,
+                    `freelancer:projects:${userId}:status:${status}:page:${page}:limit:${limit}`,
+                    `freelancer:available:projects:${userId}:page:${page}:limit:${limit}`
+                );
+            }
+        }
+    }
+
+    // Delete all caches
+    await Promise.all(cacheKeysToDelete.map(key => deleteCache(key)));
+};
 
 
 
