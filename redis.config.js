@@ -1,5 +1,6 @@
 import { createClient } from 'redis';
-
+import dotenv from 'dotenv';
+dotenv.config();
 // Check if REDIS_URL exists
 if (!process.env.REDIS_URL) {
     console.error('REDIS_URL environment variable is not set');
