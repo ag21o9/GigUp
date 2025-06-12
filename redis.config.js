@@ -1,7 +1,14 @@
 import { createClient } from 'redis';
+import dotenv from 'dotenv';
+dotenv.config();
+// Check if REDIS_URL exists
+if (!process.env.REDIS_URL) {
+    console.error('REDIS_URL environment variable is not set');
+    process.exit(1);
+}
 
 const redisClient = createClient({
-    url: process.env.REDIS_URL || 'redis://localhost:6379'
+    url: process.env.REDIS_URL
 });
 
 redisClient.on('error', (err) => {
