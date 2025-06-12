@@ -1473,6 +1473,544 @@ flRouter.get('/ratings/stats', authenticateToken, async (req, res) => {
     }
 });
 
+// GET /api/freelancer/meetings - Get all meetings for freelancer
+flRouter.get('/meetings', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { status, page = 1, limit = 10 } = req.query;
+
+        const cacheKey = `freelancer:meetings:${userId}:status:${status || 'all'}:page:${page}:limit:${limit}`;
+        
+        const cachedMeetings = await getCache(cacheKey);
+        if (cachedMeetings) {
+            return res.status(200).json({
+                success: true,
+                data: cachedMeetings,
+                cached: true
+            });
+        }
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        const freelancer = await prisma.freelancer.findUnique({
+            where: { userId }
+        });
+
+        if (!freelancer) {
+            return res.status(404).json({
+                success: false,
+                message: 'Freelancer not found'
+            });
+        }
+
+        const whereClause = {
+            freelancerId: freelancer.id
+        };
+
+        if (status) {
+            whereClause.status = status.toUpperCase();
+        }
+
+        const [meetings, totalMeetings] = await Promise.all([
+            prisma.meeting.findMany({
+                where: whereClause,
+                include: {
+                    project: {
+                        select: {
+                            title: true,
+                            description: true,
+                            client: {
+                                include: {
+                                    user: {
+                                        select: {
+                                            name: true,
+                                            email: true,
+                                            profileImage: true
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                orderBy: {
+                    scheduledDate: 'asc'
+                },
+                skip,
+                take: parseInt(limit)
+            }),
+            prisma.meeting.count({
+                where: whereClause
+            })
+        ]);
+
+        const responseData = {
+            meetings,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total: totalMeetings,
+                pages: Math.ceil(totalMeetings / parseInt(limit))
+            }
+        };
+
+        await setCache(cacheKey, responseData, 180);
+
+        res.status(200).json({
+            success: true,
+            data: responseData
+        });
+
+    } catch (error) {
+        console.error('Get freelancer meetings error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// PUT /api/freelancer/meetings/:meetingId/request-reschedule - Request meeting reschedule
+flRouter.put('/meetings/:meetingId/request-reschedule', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { meetingId } = req.params;
+        const { rescheduleReason, suggestedDates } = req.body;
+
+        if (!rescheduleReason) {
+            return res.status(400).json({
+                success: false,
+                message: 'Reschedule reason is required'
+            });
+        }
+
+        const freelancer = await prisma.freelancer.findUnique({
+            where: { userId }
+        });
+
+        if (!freelancer) {
+            return res.status(404).json({
+                success: false,
+                message: 'Freelancer not found'
+            });
+        }
+
+        const meeting = await prisma.meeting.findFirst({
+            where: {
+                id: meetingId,
+                freelancerId: freelancer.id
+            }
+        });
+
+        if (!meeting) {
+            return res.status(404).json({
+                success: false,
+                message: 'Meeting not found'
+            });
+        }
+
+        // Update meeting with reschedule request
+        const updatedMeeting = await prisma.meeting.update({
+            where: { id: meetingId },
+            data: {
+                notes: `${meeting.notes || ''}\n\nFreelancer Reschedule Request: ${rescheduleReason}${suggestedDates ? `\nSuggested Dates: ${suggestedDates}` : ''}`
+            }
+        });
+
+        res.status(200).json({
+            success: true,
+            message: 'Reschedule request sent to client',
+            data: updatedMeeting
+        });
+
+    } catch (error) {
+        console.error('Request reschedule error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// POST /api/freelancer/projects/:projectId/meetings/request - Request a meeting with client
+flRouter.post('/projects/:projectId/meetings/request', authenticateToken, checkFreelancerActive, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { projectId } = req.params;
+        const { 
+            requestReason,
+            suggestedDates, // Array of suggested dates/times
+            meetingType = 'GENERAL', // CLARIFICATION, PROGRESS_UPDATE, ISSUE_DISCUSSION, GENERAL
+            urgency = 'NORMAL', // LOW, NORMAL, HIGH, URGENT
+            description,
+            preferredDuration = 30
+        } = req.body;
+
+        // Validation
+        if (!requestReason) {
+            return res.status(400).json({
+                success: false,
+                message: 'Meeting request reason is required'
+            });
+        }
+
+        // Use freelancer from middleware
+        const freelancer = req.freelancer;
+
+        // Check if project exists and is assigned to this freelancer
+        const project = await prisma.project.findFirst({
+            where: {
+                id: projectId,
+                assignedTo: freelancer.id,
+                status: { in: ['ASSIGNED', 'PENDING_COMPLETION'] }
+            },
+            include: {
+                client: {
+                    include: {
+                        user: {
+                            select: {
+                                id: true,
+                                name: true,
+                                email: true,
+                                isActive: true
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        if (!project) {
+            return res.status(404).json({
+                success: false,
+                message: 'Project not found, not assigned to you, or not in correct status'
+            });
+        }
+
+        // Check if client is still active
+        if (!project.client.user.isActive) {
+            return res.status(400).json({
+                success: false,
+                message: 'Cannot request meeting. Client account is inactive.'
+            });
+        }
+
+        // Get the application for this project
+        const application = await prisma.application.findFirst({
+            where: {
+                projectId,
+                freelancerId: freelancer.id,
+                status: 'APPROVED'
+            }
+        });
+
+        if (!application) {
+            return res.status(400).json({
+                success: false,
+                message: 'No approved application found for this project'
+            });
+        }
+
+        // Create meeting request entry
+        const meetingRequest = await prisma.meetingRequest.create({
+            data: {
+                projectId,
+                applicationId: application.id,
+                requesterId: userId,
+                requesterType: 'FREELANCER',
+                clientId: project.client.id,
+                freelancerId: freelancer.id,
+                requestReason,
+                meetingType,
+                urgency,
+                description: description || `${meetingType} meeting requested for project: ${project.title}`,
+                suggestedDates: suggestedDates || [],
+                preferredDuration: parseInt(preferredDuration),
+                status: 'PENDING'
+            },
+            include: {
+                project: {
+                    select: {
+                        title: true,
+                        description: true,
+                        client: {
+                            include: {
+                                user: {
+                                    select: {
+                                        name: true,
+                                        email: true,
+                                        profileImage: true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Invalidate client dashboard cache (new meeting request)
+        const cacheKeysToDelete = [
+            `client:dashboard:${project.client.user.id}`,
+            `freelancer:dashboard:${userId}`
+        ];
+
+        // Clear meeting request caches
+        for (let page = 1; page <= 10; page++) {
+            for (let limit of [10, 20, 50]) {
+                cacheKeysToDelete.push(
+                    `client:meeting-requests:${project.client.user.id}:status:all:page:${page}:limit:${limit}`,
+                    `client:meeting-requests:${project.client.user.id}:status:PENDING:page:${page}:limit:${limit}`,
+                    `freelancer:meeting-requests:${userId}:status:all:page:${page}:limit:${limit}`,
+                    `freelancer:meeting-requests:${userId}:status:PENDING:page:${page}:limit:${limit}`
+                );
+            }
+        }
+
+        await Promise.all(cacheKeysToDelete.map(key => deleteCache(key)));
+
+        res.status(201).json({
+            success: true,
+            message: 'Meeting request sent to client successfully',
+            data: meetingRequest
+        });
+
+    } catch (error) {
+        console.error('Request meeting error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// GET /api/freelancer/meeting-requests - Get all meeting requests made by freelancer
+flRouter.get('/meeting-requests', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { status, page = 1, limit = 10 } = req.query;
+
+        const cacheKey = `freelancer:meeting-requests:${userId}:status:${status || 'all'}:page:${page}:limit:${limit}`;
+        
+        const cachedRequests = await getCache(cacheKey);
+        if (cachedRequests) {
+            return res.status(200).json({
+                success: true,
+                data: cachedRequests,
+                cached: true
+            });
+        }
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        const freelancer = await prisma.freelancer.findUnique({
+            where: { userId }
+        });
+
+        if (!freelancer) {
+            return res.status(404).json({
+                success: false,
+                message: 'Freelancer not found'
+            });
+        }
+
+        const whereClause = {
+            requesterId: userId,
+            requesterType: 'FREELANCER'
+        };
+
+        if (status) {
+            whereClause.status = status.toUpperCase();
+        }
+
+        const [requests, totalRequests] = await Promise.all([
+            prisma.meetingRequest.findMany({
+                where: whereClause,
+                include: {
+                    project: {
+                        select: {
+                            title: true,
+                            description: true,
+                            client: {
+                                include: {
+                                    user: {
+                                        select: {
+                                            name: true,
+                                            email: true,
+                                            profileImage: true
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    createdMeeting: {
+                        select: {
+                            id: true,
+                            title: true,
+                            scheduledDate: true,
+                            scheduledTime: true,
+                            googleMeetLink: true,
+                            status: true
+                        }
+                    }
+                },
+                orderBy: {
+                    createdAt: 'desc'
+                },
+                skip,
+                take: parseInt(limit)
+            }),
+            prisma.meetingRequest.count({
+                where: whereClause
+            })
+        ]);
+
+        const responseData = {
+            requests,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total: totalRequests,
+                pages: Math.ceil(totalRequests / parseInt(limit))
+            }
+        };
+
+        await setCache(cacheKey, responseData, 180);
+
+        res.status(200).json({
+            success: true,
+            data: responseData
+        });
+
+    } catch (error) {
+        console.error('Get meeting requests error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// GET /api/freelancer/projects/:projectId/meetings - Get all meetings for a specific project
+flRouter.get('/projects/:projectId/meetings', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { projectId } = req.params;
+        const { status, page = 1, limit = 10 } = req.query;
+
+        const cacheKey = `freelancer:project:${projectId}:meetings:status:${status || 'all'}:page:${page}:limit:${limit}`;
+        
+        const cachedMeetings = await getCache(cacheKey);
+        if (cachedMeetings) {
+            return res.status(200).json({
+                success: true,
+                data: cachedMeetings,
+                cached: true
+            });
+        }
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        const freelancer = await prisma.freelancer.findUnique({
+            where: { userId }
+        });
+
+        if (!freelancer) {
+            return res.status(404).json({
+                success: false,
+                message: 'Freelancer not found'
+            });
+        }
+
+        // Verify project is assigned to freelancer
+        const project = await prisma.project.findFirst({
+            where: {
+                id: projectId,
+                assignedTo: freelancer.id
+            }
+        });
+
+        if (!project) {
+            return res.status(404).json({
+                success: false,
+                message: 'Project not found or not assigned to you'
+            });
+        }
+
+        const whereClause = {
+            projectId,
+            freelancerId: freelancer.id
+        };
+
+        if (status) {
+            whereClause.status = status.toUpperCase();
+        }
+
+        const [meetings, totalMeetings] = await Promise.all([
+            prisma.meeting.findMany({
+                where: whereClause,
+                include: {
+                    project: {
+                        select: {
+                            title: true,
+                            description: true,
+                            client: {
+                                include: {
+                                    user: {
+                                        select: {
+                                            name: true,
+                                            email: true,
+                                            profileImage: true
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                orderBy: {
+                    scheduledDate: 'desc'
+                },
+                skip,
+                take: parseInt(limit)
+            }),
+            prisma.meeting.count({
+                where: whereClause
+            })
+        ]);
+
+        const responseData = {
+            meetings,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total: totalMeetings,
+                pages: Math.ceil(totalMeetings / parseInt(limit))
+            }
+        };
+
+        await setCache(cacheKey, responseData, 180);
+
+        res.status(200).json({
+            success: true,
+            data: responseData
+        });
+
+    } catch (error) {
+        console.error('Get freelancer project meetings error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
 // Error handling middleware for multer
 flRouter.use((error, req, res, next) => {
     if (error instanceof multer.MulterError) {
