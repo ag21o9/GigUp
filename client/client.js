@@ -1676,6 +1676,491 @@ clientRouter.put('/meetings/:meetingId/reschedule', authenticateToken, async (re
     }
 });
 
+// POST /api/client/applications/:applicationId/meetings - Schedule interview meeting with pending application
+clientRouter.post('/applications/:applicationId/meetings', authenticateToken, checkClientActive, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { applicationId } = req.params;
+        const { 
+            googleMeetLink, 
+            meetingDate, 
+            meetingTime, 
+            timezone = 'UTC',
+            meetingTitle = 'Application Interview',
+            duration = 60
+        } = req.body;
+
+        // Validation
+        if (!googleMeetLink || !meetingDate || !meetingTime) {
+            return res.status(400).json({
+                success: false,
+                message: 'Google Meet link, meeting date, and time are required'
+            });
+        }
+
+        // Validate meeting date is in the future
+        const scheduledDateTime = new Date(`${meetingDate}T${meetingTime}`);
+        if (scheduledDateTime <= new Date()) {
+            return res.status(400).json({
+                success: false,
+                message: 'Meeting must be scheduled for a future date and time'
+            });
+        }
+
+        // Validate Google Meet link
+        if (!googleMeetLink.includes('meet.google.com')) {
+            return res.status(400).json({
+                success: false,
+                message: 'Please provide a valid Google Meet link'
+            });
+        }
+
+        const client = await prisma.client.findUnique({
+            where: { userId }
+        });
+
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                message: 'Client not found'
+            });
+        }
+
+        // Get application and verify it belongs to client and is pending
+        const application = await prisma.application.findFirst({
+            where: {
+                id: applicationId,
+                status: 'PENDING',
+                project: {
+                    clientId: client.id
+                }
+            },
+            include: {
+                project: {
+                    select: {
+                        id: true,
+                        title: true,
+                        status: true
+                    }
+                },
+                freelancer: {
+                    include: {
+                        user: {
+                            select: {
+                                id: true,
+                                name: true,
+                                email: true,
+                                isActive: true
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        if (!application) {
+            return res.status(404).json({
+                success: false,
+                message: 'Application not found, not pending, or you do not have permission'
+            });
+        }
+
+        // Check if freelancer is active
+        if (!application.freelancer.user.isActive) {
+            return res.status(400).json({
+                success: false,
+                message: 'Cannot schedule meeting. Freelancer account is inactive.'
+            });
+        }
+
+        // Check if project is still open
+        if (application.project.status !== 'OPEN') {
+            return res.status(400).json({
+                success: false,
+                message: 'Project is no longer open for applications'
+            });
+        }
+
+        // Create meeting
+        const meeting = await prisma.meeting.create({
+            data: {
+                projectId: application.project.id,
+                applicationId,
+                clientId: client.id,
+                freelancerId: application.freelancerId,
+                title: meetingTitle,
+                description: `Interview meeting to discuss application for project: ${application.project.title}. This is an opportunity to understand the project requirements better and showcase your skills.`,
+                googleMeetLink,
+                scheduledDate: new Date(meetingDate),
+                scheduledTime: meetingTime,
+                timezone,
+                duration: parseInt(duration),
+                notes: `Meeting Type: INTERVIEW | Application Status: PENDING`
+            },
+            include: {
+                project: {
+                    select: {
+                        title: true
+                    }
+                },
+                application: {
+                    include: {
+                        freelancer: {
+                            include: {
+                                user: {
+                                    select: {
+                                        name: true,
+                                        email: true,
+                                        profileImage: true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Invalidate caches
+        const freelancerUserId = application.freelancer.user.id;
+        const cacheKeysToDelete = [
+            `client:dashboard:${userId}`,
+            `freelancer:dashboard:${freelancerUserId}`
+        ];
+
+        // Clear meeting caches
+        for (let page = 1; page <= 5; page++) {
+            for (let limit of [10, 20, 50]) {
+                cacheKeysToDelete.push(
+                    `client:meetings:${userId}:status:all:page:${page}:limit:${limit}`,
+                    `client:meetings:${userId}:status:SCHEDULED:page:${page}:limit:${limit}`,
+                    `freelancer:meetings:${freelancerUserId}:status:all:page:${page}:limit:${limit}`,
+                    `freelancer:meetings:${freelancerUserId}:status:SCHEDULED:page:${page}:limit:${limit}`,
+                    `client:application:${applicationId}:meetings:all`,
+                    `freelancer:application:${applicationId}:meetings:all`
+                );
+            }
+        }
+
+        await Promise.all(cacheKeysToDelete.map(key => deleteCache(key)));
+
+        res.status(201).json({
+            success: true,
+            message: 'Interview meeting scheduled successfully',
+            data: meeting
+        });
+
+    } catch (error) {
+        console.error('Create application meeting error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// PUT /api/client/meetings/:meetingId/action - Universal meeting action (reschedule/complete)
+clientRouter.put('/meetings/:meetingId/action', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { meetingId } = req.params;
+        const { 
+            action, // 'reschedule' or 'complete'
+            // For reschedule
+            newDate,
+            newTime,
+            newGoogleMeetLink,
+            rescheduleReason,
+            timezone = 'UTC',
+            duration,
+            // For complete
+            meetingNotes,
+            nextSteps
+        } = req.body;
+
+        if (!action || !['reschedule', 'complete'].includes(action)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Valid action is required: reschedule or complete'
+            });
+        }
+
+        const client = await prisma.client.findUnique({
+            where: { userId }
+        });
+
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                message: 'Client not found'
+            });
+        }
+
+        // Get meeting and verify ownership
+        const meeting = await prisma.meeting.findFirst({
+            where: {
+                id: meetingId,
+                clientId: client.id
+            },
+            include: {
+                application: {
+                    include: {
+                        freelancer: {
+                            include: {
+                                user: {
+                                    select: {
+                                        id: true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                project: {
+                    select: {
+                        title: true
+                    }
+                }
+            }
+        });
+
+        if (!meeting) {
+            return res.status(404).json({
+                success: false,
+                message: 'Meeting not found or you do not have permission'
+            });
+        }
+
+        let updatedMeeting;
+        let message;
+
+        if (action === 'reschedule') {
+            // Validation for reschedule
+            if (!newDate || !newTime || !rescheduleReason) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'New date, time, and reschedule reason are required'
+                });
+            }
+
+            const newScheduledDateTime = new Date(`${newDate}T${newTime}`);
+            if (newScheduledDateTime <= new Date()) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'New meeting must be scheduled for a future date and time'
+                });
+            }
+
+            if (meeting.status === 'COMPLETED' || meeting.status === 'CANCELLED') {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Cannot reschedule a completed or cancelled meeting'
+                });
+            }
+
+            updatedMeeting = await prisma.meeting.update({
+                where: { id: meetingId },
+                data: {
+                    scheduledDate: new Date(newDate),
+                    scheduledTime: newTime,
+                    timezone,
+                    ...(duration && { duration: parseInt(duration) }),
+                    ...(newGoogleMeetLink && { googleMeetLink: newGoogleMeetLink }),
+                    rescheduleReason,
+                    status: 'RESCHEDULED',
+                    reminderSent: false
+                }
+            });
+            message = 'Meeting rescheduled successfully';
+
+        } else if (action === 'complete') {
+            if (meeting.status === 'CANCELLED') {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Cannot complete a cancelled meeting'
+                });
+            }
+
+            updatedMeeting = await prisma.meeting.update({
+                where: { id: meetingId },
+                data: {
+                    status: 'COMPLETED',
+                    notes: meetingNotes ? `${meeting.notes || ''}\n\nMeeting Notes: ${meetingNotes}` : meeting.notes,
+                    description: nextSteps ? `${meeting.description || ''}\n\nNext Steps: ${nextSteps}` : meeting.description
+                }
+            });
+            message = 'Meeting marked as completed';
+        }
+
+        // Invalidate caches
+        const freelancerUserId = meeting.application.freelancer.user.id;
+        const cacheKeysToDelete = [
+            `client:meetings:${userId}`,
+            `freelancer:meetings:${freelancerUserId}`
+        ];
+
+        // Clear status-specific caches
+        const statuses = ['all', 'SCHEDULED', 'RESCHEDULED', 'COMPLETED', 'CANCELLED'];
+        for (let page = 1; page <= 5; page++) {
+            for (let limit of [10, 20, 50]) {
+                for (const status of statuses) {
+                    cacheKeysToDelete.push(
+                        `client:meetings:${userId}:status:${status}:page:${page}:limit:${limit}`,
+                        `freelancer:meetings:${freelancerUserId}:status:${status}:page:${page}:limit:${limit}`
+                    );
+                }
+            }
+        }
+
+        await Promise.all(cacheKeysToDelete.map(key => deleteCache(key)));
+
+        res.status(200).json({
+            success: true,
+            message,
+            data: updatedMeeting
+        });
+
+    } catch (error) {
+        console.error('Meeting action error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+
+// GET /api/client/applications/:applicationId/meetings - Get meetings for specific application
+clientRouter.get('/applications/:applicationId/meetings', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { applicationId } = req.params;
+        const { status, page = 1, limit = 10 } = req.query;
+
+        const cacheKey = `client:application:${applicationId}:meetings:status:${status || 'all'}:page:${page}:limit:${limit}`;
+        
+        const cachedMeetings = await getCache(cacheKey);
+        if (cachedMeetings) {
+            return res.status(200).json({
+                success: true,
+                data: cachedMeetings,
+                cached: true
+            });
+        }
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        const client = await prisma.client.findUnique({
+            where: { userId }
+        });
+
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                message: 'Client not found'
+            });
+        }
+
+        // Verify application belongs to client
+        const application = await prisma.application.findFirst({
+            where: {
+                id: applicationId,
+                project: {
+                    clientId: client.id
+                }
+            },
+            include: {
+                project: {
+                    select: {
+                        title: true
+                    }
+                },
+                freelancer: {
+                    include: {
+                        user: {
+                            select: {
+                                name: true,
+                                email: true,
+                                profileImage: true
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        if (!application) {
+            return res.status(404).json({
+                success: false,
+                message: 'Application not found or you do not have permission'
+            });
+        }
+
+        const whereClause = {
+            applicationId
+        };
+
+        if (status) {
+            whereClause.status = status.toUpperCase();
+        }
+
+        const [meetings, totalMeetings] = await Promise.all([
+            prisma.meeting.findMany({
+                where: whereClause,
+                include: {
+                    project: {
+                        select: {
+                            title: true,
+                            description: true
+                        }
+                    }
+                },
+                orderBy: {
+                    scheduledDate: 'desc'
+                },
+                skip,
+                take: parseInt(limit)
+            }),
+            prisma.meeting.count({
+                where: whereClause
+            })
+        ]);
+
+        const responseData = {
+            application: {
+                id: application.id,
+                status: application.status,
+                project: application.project,
+                freelancer: application.freelancer
+            },
+            meetings,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total: totalMeetings,
+                pages: Math.ceil(totalMeetings / parseInt(limit))
+            }
+        };
+
+        await setCache(cacheKey, responseData, 180);
+
+        res.status(200).json({
+            success: true,
+            data: responseData
+        });
+
+    } catch (error) {
+        console.error('Get application meetings error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
 // PUT /api/client/meetings/:meetingId/cancel - Cancel a meeting
 clientRouter.put('/meetings/:meetingId/cancel', authenticateToken, async (req, res) => {
     try {

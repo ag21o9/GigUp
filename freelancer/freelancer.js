@@ -2032,6 +2032,131 @@ flRouter.use((error, req, res, next) => {
     next(error);
 });
 
+// GET /api/freelancer/applications/:applicationId/meetings - Get meetings for specific application (freelancer view)
+flRouter.get('/applications/:applicationId/meetings', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { applicationId } = req.params;
+        const { status, page = 1, limit = 10 } = req.query;
+
+        const cacheKey = `freelancer:application:${applicationId}:meetings:status:${status || 'all'}:page:${page}:limit:${limit}`;
+        
+        const cachedMeetings = await getCache(cacheKey);
+        if (cachedMeetings) {
+            return res.status(200).json({
+                success: true,
+                data: cachedMeetings,
+                cached: true
+            });
+        }
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        const freelancer = await prisma.freelancer.findUnique({
+            where: { userId }
+        });
+
+        if (!freelancer) {
+            return res.status(404).json({
+                success: false,
+                message: 'Freelancer not found'
+            });
+        }
+
+        // Verify application belongs to freelancer
+        const application = await prisma.application.findFirst({
+            where: {
+                id: applicationId,
+                freelancerId: freelancer.id
+            },
+            include: {
+                project: {
+                    select: {
+                        title: true,
+                        client: {
+                            include: {
+                                user: {
+                                    select: {
+                                        name: true,
+                                        email: true,
+                                        profileImage: true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        if (!application) {
+            return res.status(404).json({
+                success: false,
+                message: 'Application not found or not yours'
+            });
+        }
+
+        const whereClause = {
+            applicationId
+        };
+
+        if (status) {
+            whereClause.status = status.toUpperCase();
+        }
+
+        const [meetings, totalMeetings] = await Promise.all([
+            prisma.meeting.findMany({
+                where: whereClause,
+                include: {
+                    project: {
+                        select: {
+                            title: true,
+                            description: true
+                        }
+                    }
+                },
+                orderBy: {
+                    scheduledDate: 'desc'
+                },
+                skip,
+                take: parseInt(limit)
+            }),
+            prisma.meeting.count({
+                where: whereClause
+            })
+        ]);
+
+        const responseData = {
+            application: {
+                id: application.id,
+                status: application.status,
+                project: application.project
+            },
+            meetings,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total: totalMeetings,
+                pages: Math.ceil(totalMeetings / parseInt(limit))
+            }
+        };
+
+        await setCache(cacheKey, responseData, 180);
+
+        res.status(200).json({
+            success: true,
+            data: responseData
+        });
+
+    } catch (error) {
+        console.error('Get freelancer application meetings error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
 // Add this helper function at the top of freelancer.js after imports
 
 const invalidateFreelancerCaches = async (userId, freelancerId = null) => {
