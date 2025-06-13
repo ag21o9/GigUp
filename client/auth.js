@@ -10,7 +10,9 @@ import { setCache, getCache, deleteCache } from '../utils/redis.js';
 import transporter from '../nodemailer.config.js';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import { v2 as cloudinary } from 'cloudinary';
 import prisma from '../prisma.config.js';
+import { uploadImage, deleteImage } from '../utils/cloudinary.js';
 
 // Helper function to generate JWT token
 const generateToken = (userId, role) => {
@@ -25,6 +27,71 @@ const generateToken = (userId, role) => {
 const isValidEmail = (email) => {
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     return emailRegex.test(email);
+};
+
+// Helper function to invalidate client caches
+const invalidateClientCaches = async (userId, clientId = null) => {
+    const cacheKeysToDelete = [
+        // Client specific caches
+        `client:profile:${userId}`,
+        `client:dashboard:${userId}`,
+        
+        // Public caches
+        'public:projects:recent',
+        'public:featured:clients',
+        'admin:dashboard:stats'
+    ];
+
+    // Add project-related caches with different filters
+    const statuses = ['all', 'OPEN', 'ASSIGNED', 'COMPLETED', 'PENDING_COMPLETION'];
+    const pages = Array.from({length: 5}, (_, i) => i + 1);
+    const limits = [10, 20, 50];
+
+    for (const status of statuses) {
+        for (const page of pages) {
+            for (const limit of limits) {
+                cacheKeysToDelete.push(
+                    `client:projects:${userId}:status:${status}:page:${page}:limit:${limit}`,
+                    `client:applications:${userId}:status:${status}:page:${page}:limit:${limit}`,
+                    `client:meetings:${userId}:status:${status}:page:${page}:limit:${limit}`
+                );
+            }
+        }
+    }
+
+    // Delete all caches
+    await Promise.all(cacheKeysToDelete.map(key => deleteCache(key)));
+};
+
+// Calculate profile completeness
+const calculateClientProfileCompleteness = (user, client) => {
+    const fields = {
+        name: user.name ? 10 : 0,
+        bio: user.bio ? 15 : 0,
+        profileImage: user.profileImage ? 10 : 0,
+        location: user.location ? 5 : 0,
+        phone: user.phone ? 10 : 0,
+        website: user.website ? 5 : 0,
+        companyName: client.companyName ? 10 : 0,
+        companySize: client.companySize ? 5 : 0,
+        industry: client.industry ? 10 : 0,
+        companyWebsite: client.companyWebsite ? 5 : 0,
+        preferredCategories: (client.preferredCategories && client.preferredCategories.length > 0) ? 10 : 0,
+        budgetRange: client.budgetRange ? 5 : 0,
+        communicationPreference: client.communicationPreference ? 5 : 0,
+        timezone: user.timezone ? 5 : 0
+    };
+
+    const totalScore = Object.values(fields).reduce((sum, score) => sum + score, 0);
+    const missingFields = Object.keys(fields).filter(field => fields[field] === 0);
+
+    return {
+        percentage: totalScore,
+        missingFields,
+        completedSections: totalScore >= 80 ? 
+            ['personal_info', 'contact_info', 'company_info', 'preferences', 'profile_image'] : 
+            []
+    };
 };
 
 // POST /api/client/signup
@@ -207,18 +274,17 @@ export const login = async (req, res) => {
     }
 };
 
-// PUT /api/client/profile
+// PUT /api/client/profile - Fixed hasOwnProperty error
 export const updateProfile = async (req, res) => {
     try {
-        const userId = req.user.userId; // From auth middleware
-        const {
-            name,
-            bio,
-            location,
-            companyName,
-            industry,
-            website
-        } = req.body;
+        const userId = req.user.userId;
+        let updateData = { ...req.body }; // Convert to plain object
+        
+        console.log('Update profile request:', {
+            userId,
+            hasFile: !!req.file,
+            updateData: Object.keys(updateData)
+        });
 
         // Check if user exists and is a client
         const existingUser = await prisma.user.findUnique({
@@ -229,68 +295,144 @@ export const updateProfile = async (req, res) => {
         if (!existingUser || existingUser.role !== 'CLIENT') {
             return res.status(404).json({
                 success: false,
-                message: 'Client not found'
+                message: 'Client profile not found'
             });
         }
 
         // Handle profile image upload if provided
         let profileImageUrl = existingUser.profileImage;
         if (req.file) {
-            // Delete old image if it exists
-            if (existingUser.profileImage) {
-                const publicId = existingUser.profileImage.split('/').slice(-2).join('/').split('.')[0];
-                await deleteImage(publicId);
-            }
+            try {
+                // Delete old image if it exists
+                if (existingUser.profileImage) {
+                    const publicId = existingUser.profileImage.split('/').slice(-2).join('/').split('.')[0];
+                    await deleteImage(publicId);
+                }
 
-            const uploadResult = await uploadImage(req.file.buffer, 'client-profiles');
-            if (uploadResult.success) {
-                profileImageUrl = uploadResult.url;
+                const uploadResult = await uploadImage(req.file.buffer, 'client-profiles');
+                if (uploadResult.success) {
+                    profileImageUrl = uploadResult.url;
+                    updateData.profileImage = profileImageUrl;
+                    console.log('Profile image uploaded successfully:', profileImageUrl);
+                } else {
+                    throw new Error('Failed to upload image to Cloudinary');
+                }
+            } catch (uploadError) {
+                console.error('Image upload error:', uploadError);
+                return res.status(500).json({
+                    success: false,
+                    message: 'Failed to upload profile image. Please try again.',
+                    error: uploadError.message
+                });
             }
         }
 
-        // Update user and client profile in a transaction
-        const result = await prisma.$transaction(async (tx) => {
-            // Update user
-            const updatedUser = await tx.user.update({
-                where: { id: userId },
-                data: {
-                    ...(name && { name }),
-                    ...(bio !== undefined && { bio }),
-                    ...(location !== undefined && { location }),
-                    ...(profileImageUrl && { profileImage: profileImageUrl })
-                }
+        // Validate that at least one field is provided
+        if (!updateData || Object.keys(updateData).length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'At least one field must be provided for update'
             });
+        }
 
-            // Update client profile
-            const updatedClient = await tx.client.update({
-                where: { userId },
-                data: {
-                    ...(companyName !== undefined && { companyName }),
-                    ...(industry !== undefined && { industry }),
-                    ...(website !== undefined && { website })
-                }
-            });
+        // Get previous profile completeness
+        const previousCompleteness = calculateClientProfileCompleteness(existingUser, existingUser.client);
+
+        // Prepare update data for User table - Fixed hasOwnProperty issue
+        const userUpdateData = {};
+        const userFields = ['name', 'email', 'profileImage', 'bio', 'location', 'phone', 'website', 'timezone'];
+        
+        userFields.forEach(field => {
+            if (field in updateData && updateData[field] !== undefined && updateData[field] !== '') {
+                userUpdateData[field] = updateData[field];
+            }
+        });
+
+        // Add updatedAt timestamp if any user field is being updated
+        if (Object.keys(userUpdateData).length > 0) {
+            userUpdateData.updatedAt = new Date();
+        }
+
+        // Prepare update data for Client table - Fixed hasOwnProperty issue
+        const clientUpdateData = {};
+        const clientFields = [
+            'companyName', 'companySize', 'industry', 'companyWebsite',
+            'preferredCategories', 'budgetRange', 'communicationPreference',
+            'projectNotifications', 'emailNotifications', 'marketingEmails'
+        ];
+
+        clientFields.forEach(field => {
+            if (field in updateData && updateData[field] !== undefined && updateData[field] !== '') {
+                clientUpdateData[field] = updateData[field];
+            }
+        });
+
+        // Add updatedAt timestamp if any client field is being updated
+        if (Object.keys(clientUpdateData).length > 0) {
+            clientUpdateData.updatedAt = new Date();
+        }
+
+        // Perform updates in transaction
+        const result = await prisma.$transaction(async (tx) => {
+            let updatedUser = existingUser;
+            let updatedClient = existingUser.client;
+
+            // Update User table if needed
+            if (Object.keys(userUpdateData).length > 0) {
+                updatedUser = await tx.user.update({
+                    where: { id: userId },
+                    data: userUpdateData,
+                    include: { client: true }
+                });
+            }
+
+            // Update Client table if needed
+            if (Object.keys(clientUpdateData).length > 0) {
+                updatedClient = await tx.client.update({
+                    where: { userId: userId },
+                    data: clientUpdateData
+                });
+                
+                // Refresh user data with updated client info
+                updatedUser = await tx.user.findUnique({
+                    where: { id: userId },
+                    include: { client: true }
+                });
+            }
 
             return { user: updatedUser, client: updatedClient };
         });
 
-        // Remove password from response
+        // Calculate new profile completeness
+        const newCompleteness = calculateClientProfileCompleteness(result.user, result.client);
+
+        // Remove sensitive data
         const { password: _, ...userWithoutPassword } = result.user;
+
+        console.log('Profile update successful:', {
+            updatedFields: Object.keys(updateData),
+            newImageUrl: profileImageUrl !== existingUser.profileImage ? profileImageUrl : undefined
+        });
 
         res.status(200).json({
             success: true,
-            message: 'Profile updated successfully',
+            message: `Profile updated successfully. ${Object.keys(updateData).length} field(s) modified.`,
             data: {
+                updatedFields: Object.keys(updateData),
                 user: userWithoutPassword,
-                client: result.client
+                client: result.client,
+                profileCompleteness: {
+                    ...newCompleteness,
+                    previousPercentage: previousCompleteness.percentage
+                }
             }
         });
 
     } catch (error) {
-        console.error('Update profile error:', error);
+        console.error('Client profile update error:', error);
         res.status(500).json({
             success: false,
-            message: 'Internal server error',
+            message: 'Internal server error. Please try again later.',
             error: error.message
         });
     }
@@ -686,4 +828,91 @@ export const verifyOTPEndpoint = async (req, res) => {
             error: error.message
         });
     }
+};
+
+// Helper function to validate individual fields
+const validateClientField = (fieldName, value) => {
+    const errors = [];
+
+    switch (fieldName) {
+        case 'name':
+            if (value && (typeof value !== 'string' || value.length < 2 || value.length > 100)) {
+                errors.push({ field: 'name', message: 'Name must be between 2 and 100 characters' });
+            }
+            break;
+
+        case 'bio':
+            if (value && (typeof value !== 'string' || value.length > 500)) {
+                errors.push({ field: 'bio', message: 'Bio must be less than 500 characters' });
+            }
+            break;
+
+        case 'email':
+            if (value && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
+                errors.push({ field: 'email', message: 'Please provide a valid email address' });
+            }
+            break;
+
+        case 'phone':
+            if (value && !/^[\+]?[\s\-\(\)]*(\d[\s\-\(\)]*){10,14}$/.test(value)) {
+                errors.push({ field: 'phone', message: 'Please provide a valid phone number' });
+            }
+            break;
+
+        case 'profileImage':
+        case 'website':
+        case 'companyWebsite':
+            if (value && !/^https?:\/\/.+\..+/.test(value)) {
+                errors.push({ field: fieldName, message: `Please provide a valid URL for ${fieldName}` });
+            }
+            break;
+
+        case 'location':
+            if (value && (typeof value !== 'string' || value.length > 100)) {
+                errors.push({ field: 'location', message: 'Location must be less than 100 characters' });
+            }
+            break;
+
+        case 'companyName':
+            if (value && (typeof value !== 'string' || value.length > 100)) {
+                errors.push({ field: 'companyName', message: 'Company name must be less than 100 characters' });
+            }
+            break;
+
+        case 'industry':
+            if (value && (typeof value !== 'string' || value.length > 50)) {
+                errors.push({ field: 'industry', message: 'Industry must be less than 50 characters' });
+            }
+            break;
+
+        case 'companySize':
+            const validSizes = ['1-10', '11-50', '51-200', '201-500', '500+'];
+            if (value && !validSizes.includes(value)) {
+                errors.push({ field: 'companySize', message: 'Invalid company size' });
+            }
+            break;
+
+        case 'communicationPreference':
+            const validPrefs = ['email', 'phone', 'chat', 'video_call'];
+            if (value && !validPrefs.includes(value)) {
+                errors.push({ field: 'communicationPreference', message: 'Invalid communication preference' });
+            }
+            break;
+
+        case 'preferredCategories':
+            if (value && (!Array.isArray(value) || value.some(cat => typeof cat !== 'string'))) {
+                errors.push({ field: 'preferredCategories', message: 'Preferred categories must be an array of strings' });
+            }
+            break;
+
+        case 'projectNotifications':
+        case 'emailNotifications':
+        case 'marketingEmails':
+            if (value !== undefined && typeof value !== 'boolean') {
+                errors.push({ field: fieldName, message: `${fieldName} must be a boolean value` });
+            }
+            break;
+    }
+
+    return errors;
 };
