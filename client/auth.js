@@ -1,10 +1,16 @@
+import { 
+    generateOTP, 
+    storeOTP, 
+    verifyOTP, 
+    isOTPVerified,
+    invalidateOTP, 
+    sendOTPEmail 
+} from '../utils/passwordReset.js';
+import { setCache, getCache, deleteCache } from '../utils/redis.js';
+import transporter from '../nodemailer.config.js';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import prisma from '../prisma.config.js';
-import { setCache, getCache } from '../utils/redis.js';
-
-
-import { uploadImage, deleteImage } from '../utils/cloudinary.js';
 
 // Helper function to generate JWT token
 const generateToken = (userId, role) => {
@@ -445,6 +451,238 @@ export const getAllFreelancers = async (req, res) => {
         res.status(500).json({
             success: false,
             message: 'Internal server error',
+            error: error.message
+        });
+    }
+};
+
+// POST /api/client/forgot-password - Send OTP
+export const forgotPassword = async (req, res) => {
+    try {
+        const { email } = req.body;
+
+        // Validation
+        if (!email) {
+            return res.status(400).json({
+                success: false,
+                message: 'Email is required'
+            });
+        }
+
+        if (!isValidEmail(email)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Please provide a valid email address'
+            });
+        }
+
+        // Check if user exists and is a client
+        const user = await prisma.user.findUnique({
+            where: { email },
+            include: { client: true }
+        });
+
+        if (!user || user.role !== 'CLIENT') {
+            return res.status(200).json({
+                success: true,
+                message: 'If a client account with this email exists, you will receive an OTP shortly.'
+            });
+        }
+
+        if (!user.isActive) {
+            return res.status(400).json({
+                success: false,
+                message: 'Account is suspended. Please contact support.'
+            });
+        }
+
+        // Check rate limiting
+        const rateLimitKey = `password_reset_rate_limit:CLIENT:${email}`;
+        const existingRequest = await getCache(rateLimitKey);
+        
+        if (existingRequest) {
+            return res.status(429).json({
+                success: false,
+                message: 'OTP already sent. Please wait 2 minutes before requesting again.'
+            });
+        }
+
+        // Generate and store OTP
+        const otp = generateOTP();
+        await storeOTP(email, otp, 'CLIENT');
+        await setCache(rateLimitKey, true, 120);
+
+        // Send OTP email
+        await sendOTPEmail(email, user.name, otp, 'Client');
+
+        res.status(200).json({
+            success: true,
+            message: 'If a client account with this email exists, you will receive an OTP shortly.',
+            data: {
+                otpSent: true,
+                expiresIn: '10 minutes'
+            }
+        });
+
+    } catch (error) {
+        console.error('Client forgot password error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error. Please try again later.',
+            error: error.message
+        });
+    }
+};
+
+// POST /api/client/verify-otp - Verify OTP and Reset Password
+export const verifyOTPEndpoint = async (req, res) => {
+    try {
+        const { email, otp, newPassword, confirmPassword } = req.body;
+
+        // Validation
+        if (!email || !otp || !newPassword || !confirmPassword) {
+            return res.status(400).json({
+                success: false,
+                message: 'Email, OTP, new password, and confirm password are required'
+            });
+        }
+
+        if (!isValidEmail(email)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Please provide a valid email address'
+            });
+        }
+
+        if (otp.length !== 6 || !/^\d{6}$/.test(otp)) {
+            return res.status(400).json({
+                success: false,
+                message: 'OTP must be 6 digits'
+            });
+        }
+
+        if (newPassword !== confirmPassword) {
+            return res.status(400).json({
+                success: false,
+                message: 'Passwords do not match'
+            });
+        }
+
+        if (newPassword.length < 6) {
+            return res.status(400).json({
+                success: false,
+                message: 'Password must be at least 6 characters long'
+            });
+        }
+
+        // Verify OTP
+        const verification = await verifyOTP(email, otp, 'CLIENT');
+        
+        if (!verification.valid) {
+            return res.status(400).json({
+                success: false,
+                message: verification.error
+            });
+        }
+
+        // Check if user exists and is a client
+        const user = await prisma.user.findUnique({
+            where: { email },
+            include: { client: true }
+        });
+
+        if (!user || user.role !== 'CLIENT') {
+            return res.status(404).json({
+                success: false,
+                message: 'Client account not found'
+            });
+        }
+
+        // Check if user account is active
+        if (!user.isActive) {
+            return res.status(400).json({
+                success: false,
+                message: 'Account is suspended. Please contact support.'
+            });
+        }
+
+        // Hash new password
+        const hashedPassword = await bcrypt.hash(newPassword, 12);
+
+        // Update password in database
+        await prisma.user.update({
+            where: { id: user.id },
+            data: { 
+                password: hashedPassword,
+                updatedAt: new Date()
+            }
+        });
+
+        // Generate new JWT token
+        const token = generateToken(user.id, user.role);
+
+        // Invalidate OTP
+        await invalidateOTP(email, 'CLIENT');
+
+        // Clear login cache
+        await deleteCache(`client:login:${email}`);
+
+        // Send confirmation email
+        const mailOptions = {
+            from: process.env.EMAIL_USER,
+            to: email,
+            subject: 'Password Successfully Reset - FreeLanceAog',
+            html: `
+                <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                    <div style="background-color: #10B981; color: white; padding: 20px; text-align: center;">
+                        <h1>✅ Password Reset Successful</h1>
+                    </div>
+                    <div style="padding: 30px; background-color: #f9f9f9;">
+                        <h2>Hello ${user.name},</h2>
+                        <p>Your client account password has been successfully reset and you are now logged in.</p>
+                        <div style="background-color: #FEF3C7; border-left: 4px solid #F59E0B; padding: 15px; margin: 20px 0;">
+                            <strong>⚠️ Security Notice:</strong>
+                            <p>If you did not make this change, please contact our support team immediately.</p>
+                        </div>
+                        <div style="background-color: #DBEAFE; border-left: 4px solid #3B82F6; padding: 15px; margin: 20px 0;">
+                            <strong>🔐 Login Information:</strong>
+                            <p>You have been automatically logged in with a new authentication token.</p>
+                        </div>
+                        <p>You can now access your account with the new password.</p>
+                        <p>Best regards,<br>The FreeLanceAog Team</p>
+                    </div>
+                </div>
+            `,
+            text: `Hello ${user.name},\n\nYour client account password has been successfully reset and you are now logged in.\n\nBest regards,\nThe FreeLanceAog Team`
+        };
+
+        transporter.sendMail(mailOptions, (error, info) => {
+            if (error) {
+                console.error('Confirmation email error:', error);
+            } else {
+                console.log('Password reset confirmation sent:', info.response);
+            }
+        });
+
+        // Remove password from user object for response
+        const { password: _, ...userWithoutPassword } = user;
+
+        res.status(200).json({
+            success: true,
+            message: 'OTP verified and password reset successfully. You are now logged in.',
+            data: {
+                verified: true,
+                passwordReset: true,
+                user: userWithoutPassword,
+                token: token
+            }
+        });
+
+    } catch (error) {
+        console.error('Client verify OTP and reset password error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error. Please try again later.',
             error: error.message
         });
     }

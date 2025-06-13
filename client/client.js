@@ -7,7 +7,9 @@ import {
     login,
     updateProfile,
     getProfile,
-    getAllFreelancers
+    getAllFreelancers,
+    forgotPassword,
+    verifyOTPEndpoint,
 } from "./auth.js";
 import { authenticateToken, checkClientActive } from "../middleware/auth.js";
 import { setCache, getCache, deleteCache } from "../utils/redis.js";
@@ -67,6 +69,8 @@ const invalidateClientCaches = async (userId, clientId = null) => {
 // Authentication Routes (Public)
 clientRouter.post('/signup', upload.single('profileImage'), signup);
 clientRouter.post('/login', login);
+clientRouter.post('/forgot-password', forgotPassword);
+clientRouter.post('/verify-otp', verifyOTPEndpoint);
 
 // Profile Management Routes (Protected)
 clientRouter.get('/profile', authenticateToken, async (req, res) => {
@@ -1788,7 +1792,7 @@ clientRouter.post('/applications/:applicationId/meetings', authenticateToken, ch
                 applicationId,
                 clientId: client.id,
                 freelancerId: application.freelancerId,
-                title: meetingTitle,
+                title: meetingTitle || `Interview with ${application.freelancer.user.name}`,
                 description: `Interview meeting to discuss application for project: ${application.project.title}. This is an opportunity to understand the project requirements better and showcase your skills.`,
                 googleMeetLink,
                 scheduledDate: new Date(meetingDate),

@@ -11,14 +11,31 @@ import { flRouter } from './freelancer/freelancer.js';
 import { clientRouter } from './client/client.js';
 import { publicRouter } from './publicRoutes/publicroutes.js';
 import { adminRouter } from './admin/admin.js';
+import transporter  from './nodemailer.config.js'; // Importing the nodemailer configuration
 
 const PORT = process.env.PORT || 3000;
 
 const app = express();
 
 
-dotenv.config();
 
+// const mailOptions = {
+//   from: "email",
+//   to: "email",
+//   subject: "title",
+//   text: "message",
+// };
+
+
+// transporter.sendMail(mailOptions, (error, info) => {
+//   if (error) {
+//     console.error("Error:", error);
+//   } else {
+//     console.log("Email sent:", info.response);
+//   }
+// });
+
+dotenv.config();
 
 
 app.use(cors());

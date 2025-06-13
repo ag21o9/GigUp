@@ -5,12 +5,16 @@ import {
     login,
     updateProfile,
     getProfile,
-    updateAvailability
+    updateAvailability,
+    forgotPassword,
+    verifyOTPEndpoint
 } from "./auth.js";
 
 import { authenticateToken, checkFreelancerActive } from "../middleware/auth.js";
 import { setCache, getCache, deleteCache } from "../utils/redis.js";
 import prisma from "../prisma.config.js";
+// Add these imports at the top
+
 
 export const flRouter = Router();
 
@@ -33,8 +37,10 @@ const upload = multer({
 // Authentication Routes (Public)
 flRouter.post('/signup', upload.single('profileImage'), signup);
 flRouter.post('/login', login);
+// Add these routes
+flRouter.post('/forgot-password', forgotPassword);
+flRouter.post('/verify-otp', verifyOTPEndpoint);
 
-// Profile Management Routes (Protected)
 flRouter.get('/profile', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.userId;
