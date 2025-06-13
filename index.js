@@ -12,6 +12,7 @@ import { clientRouter } from './client/client.js';
 import { publicRouter } from './publicRoutes/publicroutes.js';
 import { adminRouter } from './admin/admin.js';
 import transporter  from './nodemailer.config.js'; // Importing the nodemailer configuration
+import emailRouter from './routes/emailVerification.js';
 
 const PORT = process.env.PORT || 3000;
 
@@ -47,6 +48,7 @@ app.use('/api/v1/freelancer', flRouter);
 app.use('/api/v1/client', clientRouter);
 app.use('/api/v1/public', publicRouter);
 app.use('/api/v1/admin', adminRouter);
+app.use('/api/v1/email', emailRouter);
 
 
 app.listen(PORT, () => {

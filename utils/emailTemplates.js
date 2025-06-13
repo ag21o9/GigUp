@@ -1,7 +1,7 @@
 // utils/emailTemplates.js
 export const getOTPEmailTemplate = (otp, userName, userType) => {
     return {
-        subject: `Password Reset OTP - FreeLanceAog`,
+        subject: `Password Reset OTP - TheGigUp`,
         html: `
             <!DOCTYPE html>
             <html>
@@ -50,15 +50,15 @@ export const getOTPEmailTemplate = (otp, userName, userType) => {
                         
                         <div class="security-tip">
                             <strong>🛡️ Security Tip:</strong>
-                            <p>Never share this OTP with anyone. FreeLanceAog will never ask for your OTP via phone or email.</p>
+                            <p>Never share this OTP with anyone. TheGigUp will never ask for your OTP via phone or email.</p>
                         </div>
                         
                         <p>If you continue to have problems, please contact our support team.</p>
                         
-                        <p>Best regards,<br>The FreeLanceAog Team</p>
+                        <p>Best regards,<br>The TheGigUp Team</p>
                     </div>
                     <div class="footer">
-                        <p>&copy; 2024 FreeLanceAog. All rights reserved.</p>
+                        <p>&copy; 2024 TheGigUp. All rights reserved.</p>
                         <p>This is an automated email. Please do not reply to this message.</p>
                     </div>
                 </div>
@@ -78,7 +78,7 @@ export const getOTPEmailTemplate = (otp, userName, userType) => {
             If you didn't request this reset, please ignore this email.
             
             Best regards,
-            The FreeLanceAog Team
+            The TheGigUp Team
         `
     };
 };
@@ -86,7 +86,7 @@ export const getOTPEmailTemplate = (otp, userName, userType) => {
 // Keep the existing password reset email template for confirmation
 export const getPasswordResetEmailTemplate = (resetUrl, userName, userType) => {
     return {
-        subject: `Reset Your ${userType} Password - FreeLanceAog`,
+        subject: `Reset Your ${userType} Password - TheGigUp`,
         html: `
             <!DOCTYPE html>
             <html>
@@ -135,10 +135,10 @@ export const getPasswordResetEmailTemplate = (resetUrl, userName, userType) => {
                         
                         <p>If you continue to have problems, please contact our support team.</p>
                         
-                        <p>Best regards,<br>The FreeLanceAog Team</p>
+                        <p>Best regards,<br>The TheGigUp Team</p>
                     </div>
                     <div class="footer">
-                        <p>&copy; 2024 FreeLanceAog. All rights reserved.</p>
+                        <p>&copy; 2024 TheGigUp. All rights reserved.</p>
                         <p>This is an automated email. Please do not reply to this message.</p>
                     </div>
                 </div>
@@ -158,7 +158,89 @@ export const getPasswordResetEmailTemplate = (resetUrl, userName, userType) => {
             If you didn't request this reset, please ignore this email.
             
             Best regards,
-            The FreeLanceAog Team
+            The TheGigUp Team
+        `
+    };
+};
+
+export const getEmailVerificationOTPTemplate = (otp, email) => {
+    return {
+        subject: `Email Verification OTP - TheGigUp`,
+        html: `
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <style>
+                    .container { max-width: 600px; margin: 0 auto; font-family: Arial, sans-serif; }
+                    .header { background-color: #10B981; color: white; padding: 20px; text-align: center; }
+                    .content { padding: 30px; background-color: #f9f9f9; }
+                    .otp-box { 
+                        background-color: #10B981; 
+                        color: white; 
+                        font-size: 32px; 
+                        font-weight: bold; 
+                        padding: 20px; 
+                        text-align: center; 
+                        border-radius: 8px; 
+                        margin: 20px 0;
+                        letter-spacing: 8px;
+                    }
+                    .footer { background-color: #374151; color: white; padding: 20px; text-align: center; font-size: 12px; }
+                    .warning { background-color: #FEF3C7; border-left: 4px solid #F59E0B; padding: 15px; margin: 20px 0; }
+                    .security-tip { background-color: #DBEAFE; border-left: 4px solid #3B82F6; padding: 15px; margin: 20px 0; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <div class="header">
+                        <h1>📧 Email Verification OTP</h1>
+                    </div>
+                    <div class="content">
+                        <h2>Welcome to TheGigUp!</h2>
+                        <p>Please use the OTP below to verify your email address:</p>
+                        
+                        <div class="otp-box">
+                            ${otp}
+                        </div>
+                        
+                        <div class="warning">
+                            <strong>⚠️ Important:</strong>
+                            <ul>
+                                <li>This OTP will expire in <strong>10 minutes</strong></li>
+                                <li>You have <strong>3 attempts</strong> to enter the correct OTP</li>
+                                <li>If you didn't request this verification, please ignore this email</li>
+                            </ul>
+                        </div>
+                        
+                        <div class="security-tip">
+                            <strong>🛡️ Security Tip:</strong>
+                            <p>Never share this OTP with anyone. TheGigUp will never ask for your OTP via phone or email.</p>
+                        </div>
+                        
+                        <p>After verification, you can complete your account registration.</p>
+                        
+                        <p>Best regards,<br>The TheGigUp Team</p>
+                    </div>
+                    <div class="footer">
+                        <p>&copy; 2024 TheGigUp. All rights reserved.</p>
+                        <p>This is an automated email. Please do not reply to this message.</p>
+                    </div>
+                </div>
+            </body>
+            </html>
+        `,
+        text: `
+            Welcome to TheGigUp!
+            
+            Please use the OTP below to verify your email address: ${otp}
+            
+            This OTP will expire in 10 minutes.
+            You have 3 attempts to enter the correct OTP.
+            
+            If you didn't request this verification, please ignore this email.
+            
+            Best regards,
+            The TheGigUp Team
         `
     };
 };
