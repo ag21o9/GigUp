@@ -488,7 +488,7 @@ publicRouter.get('/featured/freelancers', async (req, res) => {
                 }
                 return b.projectsCompleted - a.projectsCompleted;
             })
-            .slice(0, 3); 
+            .slice(0, 4); 
 
         const responseData = sortedFreelancers.map(freelancer => ({
             id: freelancer.id,
@@ -1095,6 +1095,7 @@ publicRouter.get('/freelancers/:freelancerId/profile', async (req, res) => {
         const profileData = {
             freelancer: {
                 id: freelancer.id,
+                email : freelancer.user.email, // Consider removing for privacy
                 profile: {
                     name: freelancer.user.name,
                     profileImage: freelancer.user.profileImage,
